@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rafty
+  labels:
+    app: rafty
+spec:
+  ordinals:
+    start: 1
+  replicas: 3
+  selector:
+    matchLabels:
+      app: rafty
+  template:
+    metadata:
+      name: rafty
+      labels:
+        app: rafty
+    spec:
+      containers:
+        - name: rafty
+          image: rafty:0.4.1
+          imagePullPolicy: Never
+          env:
+            - name: RAFTY_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+            - name: RAFTY_PEERS
+              value: "rafty-1.rafty:12345,rafty-2.rafty:12345,rafty-3.rafty:12345"
+          ports:
+            - containerPort: 12345
+              protocol: TCP
+      restartPolicy: Always
+  serviceName: rafty
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rafty
+  labels:
+    app: rafty
+spec:
+  clusterIP: None
+  selector:
+    app: rafty
+  ports:
+    - port: 12345
+      targetPort: 12345
+      protocol: TCP
+      name: raft
