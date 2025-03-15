@@ -35,6 +35,8 @@ type Raft struct {
 	CurrentTerm int32
 	VotedFor    int32
 
+	log []LogEntry
+
 	LeaderID int32
 
 	lastHeartbeat time.Time
@@ -86,7 +88,11 @@ func (r *Raft) Start(ctx context.Context, addr string, port int) error {
 			select {
 			case <-ticker.C:
 				r.mu.Lock()
-				slog.Info("node-info", "leader", r.LeaderID, "term", r.CurrentTerm)
+				if r.State == Dead {
+					r.mu.Unlock()
+					continue
+				}
+				slog.Info("node-info", "id", r.ID, "leader", r.LeaderID, "term", r.CurrentTerm)
 				r.mu.Unlock()
 			}
 		}
@@ -110,10 +116,31 @@ func (r *Raft) GetState() NodeState {
 	return r.State
 }
 
+// Stop stops the Raft node.
+// It sets the state to Dead, which stops the election timer.
+// currently only for testing
 func (r *Raft) Stop() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.State = Dead
+	//r.CurrentTerm = 0
+	//r.VotedFor = -1
+	//r.LeaderID = -1
+}
+
+// Restart restarts the Raft node on term 0.
+// Sets the State to Follower and restarts the election timer.
+// currently only for testing
+func (r *Raft) Restart() {
+	r.mu.Lock()
+	r.State = Follower
+	r.CurrentTerm = 0
+	r.VotedFor = -1
+	r.LeaderID = -1
+	r.lastHeartbeat = time.Now()
+	r.mu.Unlock()
+
+	go r.ElectionTimer()
 }
 
 // RequestVote implements the gRPC RequestVote method.

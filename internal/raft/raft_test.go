@@ -22,12 +22,48 @@ func TestLeaderElection(t *testing.T) {
 	t.Logf("leader is %+v after %dms", leader, time.Since(start).Milliseconds())
 }
 
-func TestDyingLeader(t *testing.T) {
+func TestAllDyingAndRestarting(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	start := time.Now()
 	nodes := StartCluster(ctx, t, 3, 100)
+	leader, err := CheckLeader(ctx, nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("leader is %+v after %dms", leader, time.Since(start).Milliseconds())
+
+	// Kill all the nodes
+	t.Log("stop all")
+	for _, node := range nodes {
+		node.Stop()
+	}
+
+	time.Sleep(2000 * time.Millisecond)
+
+	// Restart all the nodes
+	t.Log("restart all")
+	for _, node := range nodes {
+		node.Restart()
+	}
+
+	// Wait for a new leader to be elected
+	start = time.Now()
+	newLeader, err := CheckLeader(ctx, nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("leader is %+v after %dms", newLeader, time.Since(start).Milliseconds())
+}
+
+func TestDyingLeader(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	start := time.Now()
+	nodes := StartCluster(ctx, t, 3, 200)
 	leader, err := CheckLeader(ctx, nodes)
 	if err != nil {
 		t.Fatal(err)
@@ -48,6 +84,47 @@ func TestDyingLeader(t *testing.T) {
 	t.Logf("new leader is %+v after %dms", newLeader, time.Since(start).Milliseconds())
 	if newLeader == leader {
 		t.Fatal("new leader is the same as the old leader")
+	}
+}
+
+func TestDyingLeaderWithRejoin(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	start := time.Now()
+	nodes := StartCluster(ctx, t, 3, 300)
+	leader, err := CheckLeader(ctx, nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("leader is %+v after %dms", leader, time.Since(start).Milliseconds())
+
+	// Kill the leader
+	start = time.Now()
+	t.Log("stopping leader")
+	nodes[leader].Stop()
+
+	// Wait for a new leader to be elected
+	newLeader, err := CheckLeader(ctx, nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("new leader is %+v after %dms", newLeader, time.Since(start).Milliseconds())
+	if newLeader == leader {
+		t.Fatal("new leader is the same as the old leader")
+	}
+
+	time.Sleep(2000 * time.Millisecond)
+
+	// Restart the old leader
+	t.Log("restarting old leader")
+	nodes[leader].Restart()
+	time.Sleep(time.Millisecond * 100)
+
+	if nodes[leader].CurrentTerm != nodes[newLeader].CurrentTerm {
+		t.Fatal("old leader did not rejoin the cluster")
 	}
 }
 
