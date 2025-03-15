@@ -20,6 +20,7 @@ const (
 	Follower NodeState = iota
 	Candidate
 	Leader
+	Dead
 )
 
 // Raft represents a Raft node and implements proto.RaftServiceServer.
@@ -33,16 +34,19 @@ type Raft struct {
 	CurrentTerm int32
 	VotedFor    int32
 
+	LeaderID int32
+
 	lastHeartbeat time.Time
 }
 
-// New creates a new Raft node with a given ID and list of peer addresses.
+// NewNode creates a new Raft node with a given ID and list of peer addresses.
 func NewNode(id int32, peers []string) *Raft {
 	return &Raft{
 		ID:            id,
 		Peers:         peers,
 		State:         Follower,
 		CurrentTerm:   0,
+		LeaderID:      -1, // -1 no leader has been assigned
 		VotedFor:      -1, // -1 means no vote has been given.
 		lastHeartbeat: time.Now(),
 	}
@@ -71,6 +75,20 @@ func (r *Raft) Start(ctx context.Context, addr string, port int) error {
 		errCh <- server.Serve(listener)
 	}()
 
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				r.mu.Lock()
+				slog.Info("node-info", "leader", r.LeaderID, "term", r.CurrentTerm)
+				r.mu.Unlock()
+			}
+		}
+	}()
+
 	// Wait for either context cancellation or a server error.
 	select {
 	case <-ctx.Done():
@@ -93,6 +111,10 @@ func (r *Raft) GetState() NodeState {
 func (r *Raft) RequestVote(ctx context.Context, req *proto.RequestVoteRequest) (*proto.RequestVoteResponse, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.State == Dead {
+		return nil, nil
+	}
 
 	if req.Term < r.CurrentTerm {
 		return &proto.RequestVoteResponse{
@@ -126,7 +148,12 @@ func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.State == Dead {
+		return nil, nil
+	}
+
 	r.lastHeartbeat = time.Now()
+	r.LeaderID = req.LeaderID
 
 	if req.Term < r.CurrentTerm {
 		return &proto.AppendEntriesResponse{
@@ -141,7 +168,7 @@ func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 		r.State = Follower
 	}
 
-	// For this simplified example, we assume AppendEntries is always successful.
+	// TODO: append log entries to local state
 	return &proto.AppendEntriesResponse{
 		Term:    r.CurrentTerm,
 		Success: true,
@@ -153,12 +180,12 @@ func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 // it becomes a candidate and starts an election.
 func (r *Raft) ElectionTimer() {
 	for {
-		//r.mu.Lock()
-		//if r.State == Dead {
-		//	r.mu.Unlock()
-		//	return
-		//}
-		//r.mu.Unlock()
+		r.mu.Lock()
+		if r.State == Dead {
+			r.mu.Unlock()
+			return
+		}
+		r.mu.Unlock()
 
 		// Random timeout between 150ms and 300ms.
 		timeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
@@ -227,6 +254,7 @@ func (r *Raft) StartElection() {
 	if votes >= (totalNodes/2)+1 {
 		r.mu.Lock()
 		r.State = Leader
+		r.LeaderID = r.ID
 		r.mu.Unlock()
 		go r.SendHeartbeats()
 		slog.Info("node became Leader", "node", r.ID, "term", termStarted, "votes", votes)
@@ -274,9 +302,9 @@ func (r *Raft) SendHeartbeats() {
 				// We ignore the response and error here for simplicity.
 				_, err = client.AppendEntries(ctx, req)
 				if err != nil {
-					slog.Error("failed to send heartbeat", "node", addr, "term", currentTerm, "leaderID", leaderID, "err", err)
+					slog.Error("failed to send heartbeat", "node", addr, "term", currentTerm, "LeaderID", leaderID, "err", err)
 				}
-				slog.Debug("sent leader heartbeat", "node", addr, "term", currentTerm, "leaderID", leaderID)
+				slog.Debug("sent leader heartbeat", "node", addr, "term", currentTerm, "LeaderID", leaderID)
 			}(peerAddr)
 		}
 		// Wait before sending the next round of heartbeats.
