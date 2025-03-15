@@ -27,19 +27,27 @@ const (
 type Raft struct {
 	proto.UnimplementedRaftServiceServer
 	myAddr string
+	mu     sync.Mutex
 
-	mu          sync.Mutex
-	ID          int32
-	Peers       []string // List of peer addresses (e.g., "127.0.0.1:12346") including myself
-	State       NodeState
+	State    NodeState
+	LeaderID int32
+	ID       int32
+	Peers    []string // List of peer addresses (e.g., "127.0.0.1:12346") including myself
+
+	lastHeartbeat time.Time
+
+	// persistent
+	log         []*LogEntry
 	CurrentTerm int32
 	VotedFor    int32
 
-	log []LogEntry
+	// volatile all
+	commitIndex int32 // index of highest log entry known to be committed
+	lastApplied int32 // index of highest log entry applied to state machine
 
-	LeaderID int32
-
-	lastHeartbeat time.Time
+	// volatile leader
+	nextIndex  map[string]int32 // index of the next log entry to send to each follower
+	matchIndex map[string]int32 // index of highest log entry of each follower known to be replicated
 }
 
 // NewNode creates a new Raft node with a given ID and list of peer addresses.
@@ -52,6 +60,10 @@ func NewNode(id int32, peers []string) *Raft {
 		LeaderID:      -1, // -1 no leader has been assigned
 		VotedFor:      -1, // -1 means no vote has been given.
 		lastHeartbeat: time.Now(),
+		nextIndex:     make(map[string]int32),
+		matchIndex:    make(map[string]int32),
+		commitIndex:   0,  // -1 means no log entry has been committed.
+		lastApplied:   -1, // -1 means no log entry has been applied.
 	}
 }
 
@@ -81,7 +93,7 @@ func (r *Raft) Start(ctx context.Context, addr string, port int) error {
 	}()
 
 	go func() {
-		ticker := time.NewTicker(time.Second)
+		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
 
 		for {
@@ -90,9 +102,10 @@ func (r *Raft) Start(ctx context.Context, addr string, port int) error {
 				r.mu.Lock()
 				if r.State == Dead {
 					r.mu.Unlock()
+					slog.Info("node-info [dead]", "id", r.ID, "leader", r.LeaderID, "term", r.CurrentTerm, "log", len(r.log), "commitIndex", r.commitIndex, "lastApplied", r.lastApplied)
 					continue
 				}
-				slog.Info("node-info", "id", r.ID, "leader", r.LeaderID, "term", r.CurrentTerm)
+				slog.Info("node-info", "id", r.ID, "leader", r.LeaderID, "term", r.CurrentTerm, "log", len(r.log), "commitIndex", r.commitIndex, "lastApplied", r.lastApplied)
 				r.mu.Unlock()
 			}
 		}
@@ -131,84 +144,17 @@ func (r *Raft) Stop() {
 // Restart restarts the Raft node on term 0.
 // Sets the State to Follower and restarts the election timer.
 // currently only for testing
-func (r *Raft) Restart() {
+func (r *Raft) Restart(term int32) {
 	r.mu.Lock()
 	r.State = Follower
-	r.CurrentTerm = 0
-	r.VotedFor = -1
+	r.lastHeartbeat = time.Now().Add(-500 * time.Millisecond)
 	r.LeaderID = -1
-	r.lastHeartbeat = time.Now()
+	if term != -1 {
+		r.CurrentTerm = term
+	}
 	r.mu.Unlock()
 
 	go r.ElectionTimer()
-}
-
-// RequestVote implements the gRPC RequestVote method.
-func (r *Raft) RequestVote(ctx context.Context, req *proto.RequestVoteRequest) (*proto.RequestVoteResponse, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if r.State == Dead {
-		return nil, nil
-	}
-
-	if req.Term < r.CurrentTerm {
-		return &proto.RequestVoteResponse{
-			Term:        r.CurrentTerm,
-			VoteGranted: false,
-		}, nil
-	}
-
-	if req.Term > r.CurrentTerm {
-		r.CurrentTerm = req.Term
-		r.VotedFor = -1
-		r.State = Follower
-	}
-
-	if r.VotedFor == -1 || r.VotedFor == req.CandidateID {
-		r.VotedFor = req.CandidateID
-		return &proto.RequestVoteResponse{
-			Term:        r.CurrentTerm,
-			VoteGranted: true,
-		}, nil
-	}
-
-	return &proto.RequestVoteResponse{
-		Term:        r.CurrentTerm,
-		VoteGranted: false,
-	}, nil
-}
-
-// AppendEntries implements the gRPC AppendEntries method.
-func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesRequest) (*proto.AppendEntriesResponse, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if r.State == Dead {
-		return nil, nil
-	}
-
-	r.lastHeartbeat = time.Now()
-	r.LeaderID = req.LeaderID
-
-	if req.Term < r.CurrentTerm {
-		return &proto.AppendEntriesResponse{
-			Term:    r.CurrentTerm,
-			Success: false,
-		}, nil
-	}
-
-	if req.Term > r.CurrentTerm {
-		r.CurrentTerm = req.Term
-		r.VotedFor = -1
-		r.State = Follower
-	}
-
-	// TODO: append log entries to local state
-	return &proto.AppendEntriesResponse{
-		Term:    r.CurrentTerm,
-		Success: true,
-	}, nil
 }
 
 // ElectionTimer runs the election timeout loop.
@@ -240,14 +186,15 @@ func (r *Raft) ElectionTimer() {
 // StartElection starts an election by incrementing the term, voting for itself,
 // sending RequestVote RPCs to peers, and counting votes.
 func (r *Raft) StartElection() {
+	slog.Info("node started election", "node", r.ID, "term", r.CurrentTerm)
 	r.mu.Lock()
 	r.CurrentTerm++
 	termStarted := r.CurrentTerm
+
 	// Vote for self.
 	r.VotedFor = r.ID
-	r.mu.Unlock()
-
 	votes := 1
+	r.mu.Unlock()
 
 	totalNodes := len(r.Peers) + 1
 	var wg sync.WaitGroup
@@ -312,6 +259,14 @@ func (r *Raft) StartElection() {
 // SendHeartbeats sends periodic AppendEntries RPCs (heartbeats) to all peers.
 // When a follower receives these, it resets its lastHeartbeat.
 func (r *Raft) SendHeartbeats() {
+	// init maps
+	r.mu.Lock()
+	for _, peer := range r.Peers {
+		r.nextIndex[peer] = r.lastApplied + 1
+		r.matchIndex[peer] = 0
+	}
+	r.mu.Unlock()
+
 	for {
 		r.mu.Lock()
 
@@ -328,26 +283,103 @@ func (r *Raft) SendHeartbeats() {
 
 		// Send heartbeat to each peer concurrently.
 		for _, peerAddr := range r.Peers {
+			if peerAddr == r.myAddr {
+				// don't send to self
+				continue
+			}
 			go func(addr string) {
-				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+				// TODO: LOWER TIMEOUT AGAIN
+				ctx, cancel := context.WithTimeout(context.Background(), 100000*time.Millisecond)
 				defer cancel()
+
+				r.mu.Lock()
+
+				prevLogIndex := r.nextIndex[addr] - 1
+				prevLogTerm := 1
+
+				if prevLogIndex >= 0 {
+					prevLogTerm = int(r.log[prevLogIndex].Term)
+				}
+
+				var entries []*LogEntry
+				if len(r.log) != 0 {
+					if prevLogIndex < 0 {
+						entries = r.log
+						prevLogIndex = 0
+					} else {
+						entries = r.log[r.nextIndex[addr]:]
+					}
+				}
+
+				serializedEntries := make([]*proto.LogEntry, len(entries))
+				for i, entry := range entries {
+					serializedEntries[i] = &proto.LogEntry{
+						Command: entry.Command.(string),
+						Term:    currentTerm,
+						Index:   entry.Index,
+					}
+				}
+				r.mu.Unlock()
+
 				conn, err := grpc.DialContext(ctx, addr, grpc.WithInsecure(), grpc.WithBlock())
 				if err != nil {
 					// Could not connect; skip this peer.
 					return
 				}
 				defer conn.Close()
+
 				client := proto.NewRaftServiceClient(conn)
 				req := &proto.AppendEntriesRequest{
-					Term:     currentTerm,
-					LeaderID: leaderID,
+					Term:         currentTerm,
+					LeaderID:     leaderID,
+					PrevLogIndex: prevLogIndex,
+					PrevLogTerm:  int32(prevLogTerm),
+					Entries:      serializedEntries,
+					LeaderCommit: r.commitIndex,
 				}
+
 				// We ignore the response and error here for simplicity.
-				_, err = client.AppendEntries(ctx, req)
+				response, err := client.AppendEntries(ctx, req)
 				if err != nil {
-					slog.Error("failed to send heartbeat", "node", addr, "term", currentTerm, "LeaderID", leaderID, "err", err)
+					slog.Error("failed to send append entries", "len", len(entries), "node", addr, "term", currentTerm, "LeaderID", leaderID, "err", err)
 				}
-				slog.Debug("sent leader heartbeat", "node", addr, "term", currentTerm, "LeaderID", leaderID)
+
+				r.mu.Lock()
+				defer r.mu.Unlock()
+
+				if response.Success {
+					r.nextIndex[addr] += int32(len(entries))
+					r.matchIndex[addr] = r.nextIndex[addr]
+
+					if len(entries) != 0 {
+						slog.Info(fmt.Sprintf("node %s successfully appended %d entries to term %d", addr, len(entries), currentTerm))
+					}
+
+					savedCommitIndex := r.commitIndex
+					for N := r.commitIndex + 1; N < int32(len(r.log)); N++ {
+						if r.log[N].Term == currentTerm {
+							count := 1
+							for _, peer := range r.Peers {
+								if r.matchIndex[peer] >= N {
+									count++
+								}
+							}
+							if count*2 > len(r.Peers)+1 {
+								r.commitIndex = N
+							}
+						}
+					}
+					if r.commitIndex != savedCommitIndex {
+						slog.Info("leader committed log entry", "index", r.commitIndex, "term", currentTerm)
+						// TODO: do something with the committed log entry
+					}
+
+				} else {
+					r.nextIndex[addr] = prevLogIndex - 1
+					slog.Info(fmt.Sprintf("id %d node %s failed to append %d entries to term %d", r.ID, addr, len(entries), currentTerm))
+				}
+
+				slog.Debug("sent append entries", "node", addr, "term", currentTerm, "LeaderID", leaderID)
 			}(peerAddr)
 		}
 		// Wait before sending the next round of heartbeats.

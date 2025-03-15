@@ -46,7 +46,7 @@ func TestAllDyingAndRestarting(t *testing.T) {
 	// Restart all the nodes
 	t.Log("restart all")
 	for _, node := range nodes {
-		node.Restart()
+		node.Restart(0)
 	}
 
 	// Wait for a new leader to be elected
@@ -120,7 +120,7 @@ func TestDyingLeaderWithRejoin(t *testing.T) {
 
 	// Restart the old leader
 	t.Log("restarting old leader")
-	nodes[leader].Restart()
+	nodes[leader].Restart(0)
 	time.Sleep(time.Millisecond * 100)
 
 	if nodes[leader].CurrentTerm != nodes[newLeader].CurrentTerm {
@@ -150,7 +150,7 @@ func StartCluster(ctx context.Context, t *testing.T, count int, offset int) []*r
 
 // CheckLeader Poll the nodes for a leader for up to 10 seconds.
 func CheckLeader(ctx context.Context, nodes []*raft.Raft) (int, error) {
-	timeout := time.After(10 * time.Second)
+	timeout := time.After(1 * time.Second)
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
