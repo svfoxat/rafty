@@ -13,7 +13,7 @@ func TestLeaderElection(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	nodes := StartCluster(ctx, t, 3)
+	nodes := StartCluster(ctx, t, 3, 0)
 	leader, err := CheckLeader(ctx, nodes)
 	if err != nil {
 		t.Fatal(err)
@@ -22,21 +22,50 @@ func TestLeaderElection(t *testing.T) {
 	t.Logf("leader is %+v after %dms", leader, time.Since(start).Milliseconds())
 }
 
-func StartCluster(ctx context.Context, t *testing.T, count int) []*raft.Raft {
+func TestDyingLeader(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	start := time.Now()
+	nodes := StartCluster(ctx, t, 3, 100)
+	leader, err := CheckLeader(ctx, nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("leader is %+v after %dms", leader, time.Since(start).Milliseconds())
+
+	// Kill the leader
+	start = time.Now()
+	nodes[leader].Stop()
+
+	// Wait for a new leader to be elected
+	newLeader, err := CheckLeader(ctx, nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("new leader is %+v after %dms", newLeader, time.Since(start).Milliseconds())
+	if newLeader == leader {
+		t.Fatal("new leader is the same as the old leader")
+	}
+}
+
+func StartCluster(ctx context.Context, t *testing.T, count int, offset int) []*raft.Raft {
 	var nodes []*raft.Raft
 	var peers []string
 
 	for i := 0; i < count; i++ {
-		peers = append(peers, fmt.Sprintf("127.0.0.1:%d", 12345+i))
+		peers = append(peers, fmt.Sprintf("127.0.0.1:%d", 12345+offset+i))
 	}
-	for i := 1; i <= count; i++ {
+	for i := 0; i < count; i++ {
 		nodes = append(nodes, raft.NewNode(int32(i), peers))
 	}
 
 	// start the nodes
 	for idx, node := range nodes {
 		go func() {
-			node.Start(ctx, "127.0.0.1", 12345+idx)
+			node.Start(ctx, "127.0.0.1", 12345+offset+idx)
 		}()
 	}
 	return nodes

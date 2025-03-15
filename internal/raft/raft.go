@@ -26,10 +26,11 @@ const (
 // Raft represents a Raft node and implements proto.RaftServiceServer.
 type Raft struct {
 	proto.UnimplementedRaftServiceServer
+	myAddr string
 
 	mu          sync.Mutex
 	ID          int32
-	Peers       []string // List of peer addresses (e.g., "127.0.0.1:12346")
+	Peers       []string // List of peer addresses (e.g., "127.0.0.1:12346") including myself
 	State       NodeState
 	CurrentTerm int32
 	VotedFor    int32
@@ -61,6 +62,8 @@ func (r *Raft) Start(ctx context.Context, addr string, port int) error {
 		return fmt.Errorf("failed to listen on %s:%d: %w", addr, port, err)
 	}
 	slog.Info("listening", "id", r.ID, "addr", listener.Addr().String())
+
+	r.myAddr = listener.Addr().String()
 
 	// Create a new gRPC server and register the Raft service.
 	server := grpc.NewServer()
@@ -105,6 +108,12 @@ func (r *Raft) GetState() NodeState {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.State
+}
+
+func (r *Raft) Stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.State = Dead
 }
 
 // RequestVote implements the gRPC RequestVote method.
@@ -194,6 +203,7 @@ func (r *Raft) ElectionTimer() {
 		r.mu.Lock()
 		if r.State == Follower && time.Since(r.lastHeartbeat) > timeout {
 			r.State = Candidate
+			r.LeaderID = -1
 			go r.StartElection()
 		}
 		r.mu.Unlock()
@@ -211,12 +221,18 @@ func (r *Raft) StartElection() {
 	r.mu.Unlock()
 
 	votes := 1
+
 	totalNodes := len(r.Peers) + 1
 	var wg sync.WaitGroup
 	voteCh := make(chan bool, len(r.Peers))
 
 	// Send RequestVote RPCs concurrently.
 	for _, peerAddr := range r.Peers {
+		// I already voted for myself
+		if peerAddr == r.myAddr {
+			continue
+		}
+
 		wg.Add(1)
 		go func(addr string) {
 			defer wg.Done()
@@ -251,7 +267,7 @@ func (r *Raft) StartElection() {
 		}
 	}
 
-	if votes >= (totalNodes/2)+1 {
+	if votes*2 > totalNodes-1 {
 		r.mu.Lock()
 		r.State = Leader
 		r.LeaderID = r.ID
