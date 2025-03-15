@@ -1,6 +1,6 @@
 module github.com/svfoxat/rafty
 
-go 1.24
+go 1.24.1
 
 require (
 	google.golang.org/grpc v1.71.0
