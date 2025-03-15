@@ -124,6 +124,65 @@ func TestSubmitMultiWithDead(t *testing.T) {
 	}
 }
 
+func TestRunawayNode(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	nodes := StartCluster(ctx, t, 3, 1200)
+	leader, err := CheckLeader(ctx, nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("leader is %+v", leader)
+	t.Logf("submitting commands to leader %+v", leader)
+
+	for i := 0; i < 25; i++ {
+		nodes[leader].Submit(fmt.Sprintf("hi %d", i))
+	}
+	// wait for the commands to be replicated
+	time.Sleep(1000 * time.Millisecond)
+	if err := CheckReplication(t, nodes, leader); err != nil {
+		t.Fatal(err)
+	}
+
+	// kill the leader
+	t.Logf("stopping leader %+v", leader)
+	nodes[leader].Stop()
+
+	newLeader, err := CheckLeader(ctx, nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("newLeader is %+v", newLeader)
+
+	// submit more commands
+	for i := 0; i < 25; i++ {
+		nodes[newLeader].Submit(fmt.Sprintf("ho %d", i))
+	}
+
+	time.Sleep(5000 * time.Millisecond)
+	if err := CheckReplication(t, nodes, newLeader); err != nil {
+		t.Fatal(err)
+	}
+
+	// restart the old leader
+	t.Logf("restarting leader %+v in term 500", leader)
+	nodes[leader].Restart(500)
+	time.Sleep(100 * time.Millisecond)
+
+	// submit more commands
+	for i := 0; i < 25; i++ {
+		nodes[newLeader].Submit(fmt.Sprintf("he %d", i))
+	}
+
+	// Wait for the command to be replicated
+	time.Sleep(1000 * time.Millisecond)
+	if err := CheckReplication(t, nodes, newLeader); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func CheckReplication(t *testing.T, nodes []*raft.Raft, leaderId int) error {
 	t.Logf("checking replication for leader %+v", leaderId)
 	for _, node := range nodes {
