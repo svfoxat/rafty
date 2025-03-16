@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/svfoxat/rafty/internal/raft"
 	"github.com/svfoxat/rafty/internal/rafty"
+	"math/rand"
 	"strconv"
 	"sync"
 	"testing"
@@ -47,6 +48,36 @@ func TestKeyValueMultiKeys(t *testing.T) {
 			t.Fatal("Error getting key", i)
 		}
 		assert.Equal(t, fmt.Sprintf("value%d", i), string(response))
+	}
+}
+
+func TestKeyValueMultiKeysTtl(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	count := 100
+
+	servers := CreateCluster(ctx, t, 3)
+	leader := CheckHealthyCluster(ctx, t, servers)
+
+	for i := 0; i < count; i++ {
+		err := servers[leader].KV().Set(rafty.SetCommand{
+			Key:   fmt.Sprintf("key%d", i),
+			Value: fmt.Sprintf("value%d", i),
+			TTL:   int32(rand.Intn(10-5) + 5),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	time.Sleep(11 * time.Second)
+
+	for i := 0; i < count; i++ {
+		_, ok := servers[leader].KV().Get(fmt.Sprintf("key%d", i))
+		if ok == true {
+			t.Fatal("key should be expired", i)
+		}
 	}
 }
 

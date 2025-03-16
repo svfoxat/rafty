@@ -69,7 +69,7 @@ func NewNode(id int32, peers []string) *Raft {
 		commitIndex:       -1, // -1 means no log entry has been committed.
 		lastApplied:       -1, // -1 means no log entry has been applied.
 		TestIsPartitioned: false,
-		commitReady:       make(chan struct{}, 1000),
+		commitReady:       make(chan struct{}, 10000), // this is a bottleneck in high concurrency
 	}
 }
 

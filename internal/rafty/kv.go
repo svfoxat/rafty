@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/svfoxat/rafty/internal/raft"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,19 +15,22 @@ type KVStore struct {
 	raft *raft.Raft
 
 	// preliminary in-memory store
+	// TODO: maybe a sync.Map would be better suited
 	store map[string]*StoreEntry
 
 	entryCommited chan int32
 }
 
 type StoreEntry struct {
-	Value []byte
+	Value      []byte
+	Ttl        int32 // Time to live in seconds
+	insertedAt time.Time
 }
 
 func NewKVStore(r *raft.Raft) *KVStore {
 	return &KVStore{
 		raft:          r,
-		entryCommited: make(chan int32, 10000),
+		entryCommited: make(chan int32, 10000), // this is a bottleneck in high concurrency
 		store:         make(map[string]*StoreEntry),
 	}
 }
@@ -34,9 +38,11 @@ func NewKVStore(r *raft.Raft) *KVStore {
 func (k *KVStore) Start() {
 	slog.Info("starting kv store")
 	go k.processCommits()
-	//go k.TtlChecker()
+	go k.TtlChecker()
 }
 
+// processCommits is a goroutine that listens for new commits from the raft node
+// and processes them. It is responsible for applying the changes to the store
 func (k *KVStore) processCommits() {
 	commitChan := k.raft.Subscribe()
 
@@ -46,18 +52,56 @@ func (k *KVStore) processCommits() {
 
 		switch cmdSplit[0] {
 		case "SET":
-			//slog.Info("SET", "key", cmdSplit[1], "value", cmdSplit[2], "node", k.raft.ID)
+			// always assume ttl is present
+			ttl, err := strconv.Atoi(cmdSplit[3])
+			if err != nil {
+				slog.Error("error parsing ttl", "ttl", cmdSplit[3])
+				continue
+			}
 			k.mu.Lock()
-			k.store[cmdSplit[1]] = &StoreEntry{[]byte(cmdSplit[2])}
+			k.store[cmdSplit[1]] = &StoreEntry{[]byte(cmdSplit[2]), int32(ttl), time.Now()}
 			k.entryCommited <- entry.Index
 			k.mu.Unlock()
 
 		case "DEL":
-			//slog.Info("DEL", "key", cmdSplit[1], "node", k.raft.ID)
 			k.mu.Lock()
 			delete(k.store, cmdSplit[1])
 			k.entryCommited <- entry.Index
 			k.mu.Unlock()
+		}
+	}
+}
+
+func (k *KVStore) TtlChecker() {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	for {
+		if k.raft.State != raft.Leader {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		if <-ticker.C; true {
+			k.mu.RLock()
+			start := time.Now()
+			deleted := 0
+			var wg sync.WaitGroup
+			for key, entry := range k.store {
+				if entry.Ttl > 0 && time.Since(entry.insertedAt) > time.Duration(entry.Ttl)*time.Second {
+					go func() {
+						wg.Add(1)
+						defer wg.Done()
+						_, err := k.raft.Submit([]byte(fmt.Sprintf("DEL %s", key)))
+						if err != nil {
+							slog.Error("error submitting ttl delete", "key", key, "err", err)
+							return
+						}
+						deleted++
+					}()
+				}
+			}
+			k.mu.RUnlock()
+			wg.Wait()
+			slog.Info("ttl check", "deleted", deleted, "lock_duration", time.Since(start))
 		}
 	}
 }
@@ -84,7 +128,7 @@ func (k *KVStore) Set(cmd SetCommand) error {
 		return fmt.Errorf("not leader")
 	}
 
-	index, err := k.raft.Submit([]byte(fmt.Sprintf("SET %s %s", cmd.Key, cmd.Value)))
+	index, err := k.raft.Submit([]byte(fmt.Sprintf("SET %s %s %d", cmd.Key, cmd.Value, cmd.TTL)))
 	if err != nil {
 		return fmt.Errorf("error submitting command: %v", err)
 	}
