@@ -24,7 +24,7 @@ type StoreEntry struct {
 func NewKVStore(r *raft.Raft) *KVStore {
 	return &KVStore{
 		raft:          r,
-		entryCommited: make(chan int32, 100),
+		entryCommited: make(chan int32, 1000),
 		store:         make(map[string]*StoreEntry),
 	}
 }
@@ -44,11 +44,11 @@ func (k *KVStore) processCommits() {
 
 		switch cmdSplit[0] {
 		case "SET":
-			slog.Info("SET", "key", cmdSplit[1], "value", cmdSplit[2], "node", k.raft.ID)
+			//slog.Info("SET", "key", cmdSplit[1], "value", cmdSplit[2], "node", k.raft.ID)
 			k.store[cmdSplit[1]] = &StoreEntry{cmdSplit[2]}
 			k.entryCommited <- entry.Index
 		case "DEL":
-			slog.Info("DEL", "key", cmdSplit[1], "node", k.raft.ID)
+			//slog.Info("DEL", "key", cmdSplit[1], "node", k.raft.ID)
 			delete(k.store, cmdSplit[1])
 			k.entryCommited <- entry.Index
 		}
@@ -76,19 +76,24 @@ func (k *KVStore) Set(cmd SetCommand) error {
 
 	index, err := k.raft.Submit([]byte(fmt.Sprintf("SET %s %s", cmd.Key, cmd.Value)))
 	if err != nil {
-		return fmt.Errorf("error submitting command")
+		return fmt.Errorf("error submitting command: %v", err)
 	}
 
-	timeout := 5 * time.Second
+	timer := time.NewTimer(1 * time.Second)
+	defer timer.Stop()
+
 	for {
 		select {
-		case <-time.After(timeout):
-			slog.Error("timeout waiting for entry to be committed, may be written")
-			return nil
+		case <-timer.C:
+			return fmt.Errorf("timeout waiting for commit")
 		case id := <-k.entryCommited:
-			if id <= index {
-				slog.Info("kv success", "key", cmd.Key)
+			if id == index {
 				return nil
+			} else if id > index {
+				// Check if our command was already committed
+				if _, ok := k.store[cmd.Key]; ok {
+					return nil
+				}
 			}
 		}
 	}

@@ -41,14 +41,14 @@ func TestSubmitMulti(t *testing.T) {
 
 	// Just two batches of 25 commands each
 	t.Log("Submitting first batch of commands")
-	tc.SubmitCommands(leader, "batch1", 25)
+	tc.SubmitCommands(leader, "batch1", 1000)
 	tc.WaitForReplication(leader)
 	t.Logf("[%.3fs] First batch replicated", time.Since(start).Seconds())
 
 	time.Sleep(rafttest.ReplicationWait)
 
 	t.Log("Submitting second batch of commands")
-	tc.SubmitCommands(leader, "batch2", 25)
+	tc.SubmitCommands(leader, "batch2", 256)
 	tc.WaitForReplication(leader)
 	t.Logf("[%.3fs] Second batch replicated", time.Since(start).Seconds())
 

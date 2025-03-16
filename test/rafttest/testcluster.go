@@ -56,7 +56,7 @@ func (tc *TestCluster) SubmitCommands(leaderID int, prefix string, count int) {
 	leader := tc.Nodes[leaderID]
 	for i := 0; i < count; i++ {
 		command := fmt.Sprintf("%s_%d", prefix, i)
-		_, err := leader.Submit(command) // Removed ctx parameter
+		_, err := leader.Submit([]byte(command)) // Removed ctx parameter
 		require.NoError(tc.t, err, "failed to submit command %s", command)
 	}
 	tc.t.Logf("Submitted %d commands with prefix '%s' to leader %d", count, prefix, leaderID)
@@ -90,6 +90,28 @@ func CheckReplication(t *testing.T, nodes []*raft.Raft, leaderId int) error {
 		entries := node.GetLogEntries()
 		if node.CurrentTerm != nodes[leaderId].CurrentTerm {
 			t.Logf("Checking replication: term mismatch")
+		}
+
+		// check each entry
+		for j, entry := range entries {
+			if entry.Term != leaderEntries[j].Term {
+				t.Logf("Node %d: mismatched term at index %d (got %d, want %d)",
+					i, j, entry.Term, leaderEntries[j].Term)
+				return fmt.Errorf("node %d has term %d at index %d, leader has %d",
+					i, entry.Term, j, leaderEntries[j].Term)
+			}
+			if entry.Index != leaderEntries[j].Index {
+				t.Logf("Node %d: mismatched index at index %d (got %d, want %d)",
+					i, j, entry.Index, leaderEntries[j].Index)
+				return fmt.Errorf("node %d has index %d at index %d, leader has %d",
+					i, entry.Index, j, leaderEntries[j].Index)
+			}
+			if string(entry.Command) != string(leaderEntries[j].Command) {
+				t.Logf("Node %d: mismatched command at index %d (got %s, want %s)",
+					i, j, string(entry.Command), string(leaderEntries[j].Command))
+				return fmt.Errorf("node %d has command %s at index %d, leader has %s",
+					i, string(entry.Command), j, string(leaderEntries[j].Command))
+			}
 		}
 
 		if len(entries) != len(leaderEntries) {
