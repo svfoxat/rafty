@@ -12,6 +12,8 @@ service RaftService {
 message RequestVoteRequest {
   int32 term = 1;
   int32 candidateID = 2;
+  int32 lastLogIndex = 3;
+  int32 lastLogTerm = 4;
 }
 
 message RequestVoteResponse {

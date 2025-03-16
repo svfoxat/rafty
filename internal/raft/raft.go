@@ -20,7 +20,6 @@ const (
 	Follower NodeState = iota
 	Candidate
 	Leader
-	Dead
 )
 
 // Raft represents a Raft node and implements proto.RaftServiceServer.
@@ -48,22 +47,25 @@ type Raft struct {
 	// volatile leader
 	nextIndex  map[string]int32 // index of the next log entry to send to each follower
 	matchIndex map[string]int32 // index of highest log entry of each follower known to be replicated
+
+	TestIsPartitioned bool
 }
 
 // NewNode creates a new Raft node with a given ID and list of peer addresses.
 func NewNode(id int32, peers []string) *Raft {
 	return &Raft{
-		ID:            id,
-		Peers:         peers,
-		State:         Follower,
-		CurrentTerm:   0,
-		LeaderID:      -1, // -1 no leader has been assigned
-		VotedFor:      -1, // -1 means no vote has been given.
-		lastHeartbeat: time.Now(),
-		nextIndex:     make(map[string]int32),
-		matchIndex:    make(map[string]int32),
-		commitIndex:   0,  // -1 means no log entry has been committed.
-		lastApplied:   -1, // -1 means no log entry has been applied.
+		ID:                id,
+		Peers:             peers,
+		State:             Follower,
+		CurrentTerm:       0,
+		LeaderID:          -1, // -1 no leader has been assigned
+		VotedFor:          -1, // -1 means no vote has been given.
+		lastHeartbeat:     time.Now(),
+		nextIndex:         make(map[string]int32),
+		matchIndex:        make(map[string]int32),
+		commitIndex:       0,  // -1 means no log entry has been committed.
+		lastApplied:       -1, // -1 means no log entry has been applied.
+		TestIsPartitioned: false,
 	}
 }
 
@@ -100,9 +102,9 @@ func (r *Raft) Start(ctx context.Context, addr string, port int) error {
 			select {
 			case <-ticker.C:
 				r.mu.Lock()
-				if r.State == Dead {
+				if r.TestIsPartitioned {
 					r.mu.Unlock()
-					slog.Info("node-info [dead]", "id", r.ID, "leader", r.LeaderID, "term", r.CurrentTerm, "log", len(r.log), "commitIndex", r.commitIndex, "lastApplied", r.lastApplied)
+					slog.Info("node-info [test_partitioned]", "id", r.ID, "leader", r.LeaderID, "term", r.CurrentTerm, "log", len(r.log), "commitIndex", r.commitIndex, "lastApplied", r.lastApplied)
 					continue
 				}
 				slog.Info("node-info", "id", r.ID, "leader", r.LeaderID, "term", r.CurrentTerm, "log", len(r.log), "commitIndex", r.commitIndex, "lastApplied", r.lastApplied)
@@ -129,46 +131,33 @@ func (r *Raft) GetState() NodeState {
 	return r.State
 }
 
-// Stop stops the Raft node.
-// It sets the state to Dead, which stops the election timer.
+// TestPartition simulates a network partition for this node.
+// It will stop to respond to RPCs
 // currently only for testing
-func (r *Raft) Stop() {
+func (r *Raft) TestPartition() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.State = Dead
-	//r.CurrentTerm = 0
-	//r.VotedFor = -1
-	//r.LeaderID = -1
+
+	r.TestIsPartitioned = true
 }
 
-// Restart restarts the Raft node on term 0.
-// Sets the State to Follower and restarts the election timer.
+// TestUnpartition restores the simulated network partition for this node.
 // currently only for testing
-func (r *Raft) Restart(term int32) {
+func (r *Raft) TestUnpartition(term int32) {
 	r.mu.Lock()
-	r.State = Follower
-	r.lastHeartbeat = time.Now().Add(-500 * time.Millisecond)
-	r.LeaderID = -1
-	if term != -1 {
-		r.CurrentTerm = term
-	}
-	r.mu.Unlock()
+	defer r.mu.Unlock()
 
-	go r.ElectionTimer()
+	r.CurrentTerm = term
+	r.State = Candidate
+	r.TestIsPartitioned = false
 }
 
 // ElectionTimer runs the election timeout loop.
 // If the node is a follower and enough time has passed since the last heartbeat,
 // it becomes a candidate and starts an election.
 func (r *Raft) ElectionTimer() {
+	slog.Info("node started election timer", "node", r.ID)
 	for {
-		r.mu.Lock()
-		if r.State == Dead {
-			r.mu.Unlock()
-			return
-		}
-		r.mu.Unlock()
-
 		// Random timeout between 150ms and 300ms.
 		timeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
 		time.Sleep(timeout)
@@ -188,6 +177,7 @@ func (r *Raft) ElectionTimer() {
 func (r *Raft) StartElection() {
 	slog.Info("node started election", "node", r.ID, "term", r.CurrentTerm)
 	r.mu.Lock()
+
 	r.CurrentTerm++
 	termStarted := r.CurrentTerm
 
@@ -210,6 +200,12 @@ func (r *Raft) StartElection() {
 		wg.Add(1)
 		go func(addr string) {
 			defer wg.Done()
+
+			if r.TestIsPartitioned {
+				voteCh <- false
+				return
+			}
+
 			// Create a context with timeout.
 			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
@@ -219,10 +215,20 @@ func (r *Raft) StartElection() {
 				return
 			}
 			defer conn.Close()
+
+			lastLogTerm := int32(0)
+			if r.lastApplied == -1 {
+				lastLogTerm = 0
+			} else {
+				lastLogTerm = r.log[r.lastApplied].Term
+			}
+
 			client := proto.NewRaftServiceClient(conn)
 			req := &proto.RequestVoteRequest{
-				Term:        r.CurrentTerm,
-				CandidateID: r.ID,
+				Term:         r.CurrentTerm,
+				CandidateID:  r.ID,
+				LastLogIndex: r.lastApplied,
+				LastLogTerm:  lastLogTerm,
 			}
 			resp, err := client.RequestVote(ctx, req)
 			if err != nil {
@@ -269,61 +275,59 @@ func (r *Raft) SendHeartbeats() {
 
 	for {
 		r.mu.Lock()
-
-		// Exit if not leader
 		if r.State != Leader {
 			r.mu.Unlock()
 			return
 		}
-
-		// Capture current term and leader ID.
 		currentTerm := r.CurrentTerm
 		leaderID := r.ID
 		r.mu.Unlock()
 
-		// Send heartbeat to each peer concurrently.
 		for _, peerAddr := range r.Peers {
-			if peerAddr == r.myAddr {
-				// don't send to self
+			if r.TestIsPartitioned || peerAddr == r.myAddr {
 				continue
 			}
+
 			go func(addr string) {
-				// TODO: LOWER TIMEOUT AGAIN
-				ctx, cancel := context.WithTimeout(context.Background(), 100000*time.Millisecond)
+				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 				defer cancel()
 
 				r.mu.Lock()
-
+				// Safe array access for prevLogIndex/Term
 				prevLogIndex := r.nextIndex[addr] - 1
-				prevLogTerm := 1
+				prevLogTerm := int32(0)
 
-				if prevLogIndex >= 0 {
-					prevLogTerm = int(r.log[prevLogIndex].Term)
+				if prevLogIndex >= 0 && prevLogIndex < int32(len(r.log)) {
+					prevLogTerm = r.log[prevLogIndex].Term
 				}
 
+				// Safe entry slicing
 				var entries []*LogEntry
-				if len(r.log) != 0 {
-					if prevLogIndex < 0 {
-						entries = r.log
-						prevLogIndex = 0
-					} else {
-						entries = r.log[r.nextIndex[addr]:]
+				if len(r.log) > 0 {
+					nextIdx := r.nextIndex[addr]
+					if nextIdx < 0 {
+						nextIdx = 0
+					}
+					if nextIdx < int32(len(r.log)) {
+						entries = r.log[nextIdx:]
 					}
 				}
 
+				// Convert entries
 				serializedEntries := make([]*proto.LogEntry, len(entries))
 				for i, entry := range entries {
 					serializedEntries[i] = &proto.LogEntry{
 						Command: entry.Command.(string),
-						Term:    currentTerm,
+						Term:    entry.Term,
 						Index:   entry.Index,
 					}
 				}
+				commitIndex := r.commitIndex
 				r.mu.Unlock()
 
+				// Send AppendEntries RPC
 				conn, err := grpc.DialContext(ctx, addr, grpc.WithInsecure(), grpc.WithBlock())
 				if err != nil {
-					// Could not connect; skip this peer.
 					return
 				}
 				defer conn.Close()
@@ -333,15 +337,15 @@ func (r *Raft) SendHeartbeats() {
 					Term:         currentTerm,
 					LeaderID:     leaderID,
 					PrevLogIndex: prevLogIndex,
-					PrevLogTerm:  int32(prevLogTerm),
+					PrevLogTerm:  prevLogTerm,
 					Entries:      serializedEntries,
-					LeaderCommit: r.commitIndex,
+					LeaderCommit: commitIndex,
 				}
 
-				// We ignore the response and error here for simplicity.
 				response, err := client.AppendEntries(ctx, req)
 				if err != nil {
-					slog.Error("failed to send append entries", "len", len(entries), "node", addr, "term", currentTerm, "LeaderID", leaderID, "err", err)
+					slog.Error("append entries failed", "error", err)
+					return
 				}
 
 				r.mu.Lock()
@@ -349,40 +353,39 @@ func (r *Raft) SendHeartbeats() {
 
 				if response.Success {
 					r.nextIndex[addr] += int32(len(entries))
-					r.matchIndex[addr] = r.nextIndex[addr]
+					r.matchIndex[addr] = r.nextIndex[addr] - 1
 
-					if len(entries) != 0 {
-						slog.Info(fmt.Sprintf("node %s successfully appended %d entries to term %d", addr, len(entries), currentTerm))
-					}
-
-					savedCommitIndex := r.commitIndex
-					for N := r.commitIndex + 1; N < int32(len(r.log)); N++ {
-						if r.log[N].Term == currentTerm {
-							count := 1
-							for _, peer := range r.Peers {
-								if r.matchIndex[peer] >= N {
-									count++
+					// Update commit index if needed
+					if len(entries) > 0 {
+						for n := r.commitIndex + 1; n < int32(len(r.log)); n++ {
+							if r.log[n].Term == currentTerm {
+								matched := 1
+								for _, p := range r.Peers {
+									if r.matchIndex[p] >= n {
+										matched++
+									}
 								}
-							}
-							if count*2 > len(r.Peers)+1 {
-								r.commitIndex = N
+								if matched*2 > len(r.Peers)+1 {
+									r.commitIndex = n
+								}
 							}
 						}
 					}
-					if r.commitIndex != savedCommitIndex {
-						slog.Info("leader committed log entry", "index", r.commitIndex, "term", currentTerm)
-						// TODO: do something with the committed log entry
-					}
-
 				} else {
-					r.nextIndex[addr] = prevLogIndex - 1
-					slog.Info(fmt.Sprintf("id %d node %s failed to append %d entries to term %d", r.ID, addr, len(entries), currentTerm))
+					// Decrement nextIndex and retry
+					if r.nextIndex[addr] > 0 {
+						r.nextIndex[addr]--
+					}
+					// Step down if needed
+					if response.Term > currentTerm {
+						r.State = Follower
+						r.CurrentTerm = response.Term
+						r.VotedFor = -1
+						return
+					}
 				}
-
-				slog.Debug("sent append entries", "node", addr, "term", currentTerm, "LeaderID", leaderID)
 			}(peerAddr)
 		}
-		// Wait before sending the next round of heartbeats.
 		time.Sleep(50 * time.Millisecond)
 	}
 }

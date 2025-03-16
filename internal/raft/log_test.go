@@ -89,7 +89,7 @@ func TestSubmitMultiWithDead(t *testing.T) {
 
 	// kill the leader
 	t.Logf("stopping leader %+v", leader)
-	nodes[leader].Stop()
+	nodes[leader].TestPartition()
 
 	newLeader, err := CheckLeader(ctx, nodes)
 	if err != nil {
@@ -109,7 +109,7 @@ func TestSubmitMultiWithDead(t *testing.T) {
 
 	// restart the old leader
 	t.Logf("restarting leader %+v", leader)
-	nodes[leader].Restart(0)
+	nodes[leader].TestUnpartition(0)
 	time.Sleep(100 * time.Millisecond)
 
 	// submit more commands
@@ -148,7 +148,7 @@ func TestRunawayNode(t *testing.T) {
 
 	// kill the leader
 	t.Logf("stopping leader %+v", leader)
-	nodes[leader].Stop()
+	nodes[leader].TestPartition()
 
 	newLeader, err := CheckLeader(ctx, nodes)
 	if err != nil {
@@ -161,19 +161,24 @@ func TestRunawayNode(t *testing.T) {
 		nodes[newLeader].Submit(fmt.Sprintf("ho %d", i))
 	}
 
-	time.Sleep(5000 * time.Millisecond)
+	time.Sleep(1000 * time.Millisecond)
 	if err := CheckReplication(t, nodes, newLeader); err != nil {
 		t.Fatal(err)
 	}
 
 	// restart the old leader
-	t.Logf("restarting leader %+v in term 500", leader)
-	nodes[leader].Restart(500)
-	time.Sleep(100 * time.Millisecond)
+	t.Logf("restarting node %+v in term 500", leader)
+	nodes[leader].TestUnpartition(500)
+	time.Sleep(2000 * time.Millisecond)
 
 	// submit more commands
 	for i := 0; i < 25; i++ {
 		nodes[newLeader].Submit(fmt.Sprintf("he %d", i))
+	}
+
+	_, err = CheckLeader(context.Background(), nodes)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	// Wait for the command to be replicated
@@ -186,7 +191,7 @@ func TestRunawayNode(t *testing.T) {
 func CheckReplication(t *testing.T, nodes []*raft.Raft, leaderId int) error {
 	t.Logf("checking replication for leader %+v", leaderId)
 	for _, node := range nodes {
-		if node.GetState() == raft.Leader || node.GetState() == raft.Dead {
+		if node.GetState() == raft.Leader || node.TestIsPartitioned {
 			continue
 		}
 		entries := node.GetLogEntries()

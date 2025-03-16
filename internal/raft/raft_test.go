@@ -38,15 +38,15 @@ func TestAllDyingAndRestarting(t *testing.T) {
 	// Kill all the nodes
 	t.Log("stop all")
 	for _, node := range nodes {
-		node.Stop()
+		node.TestPartition()
 	}
 
 	time.Sleep(2000 * time.Millisecond)
 
-	// Restart all the nodes
+	// TestUnpartition all the nodes
 	t.Log("restart all")
 	for _, node := range nodes {
-		node.Restart(0)
+		node.TestUnpartition(0)
 	}
 
 	// Wait for a new leader to be elected
@@ -73,7 +73,7 @@ func TestDyingLeader(t *testing.T) {
 
 	// Kill the leader
 	start = time.Now()
-	nodes[leader].Stop()
+	nodes[leader].TestPartition()
 
 	// Wait for a new leader to be elected
 	newLeader, err := CheckLeader(ctx, nodes)
@@ -103,7 +103,7 @@ func TestDyingLeaderWithRejoin(t *testing.T) {
 	// Kill the leader
 	start = time.Now()
 	t.Log("stopping leader")
-	nodes[leader].Stop()
+	nodes[leader].TestPartition()
 
 	// Wait for a new leader to be elected
 	newLeader, err := CheckLeader(ctx, nodes)
@@ -118,9 +118,9 @@ func TestDyingLeaderWithRejoin(t *testing.T) {
 
 	time.Sleep(2000 * time.Millisecond)
 
-	// Restart the old leader
+	// TestUnpartition the old leader
 	t.Log("restarting old leader")
-	nodes[leader].Restart(0)
+	nodes[leader].TestUnpartition(0)
 	time.Sleep(time.Millisecond * 100)
 
 	if nodes[leader].CurrentTerm != nodes[newLeader].CurrentTerm {
@@ -165,7 +165,7 @@ func CheckLeader(ctx context.Context, nodes []*raft.Raft) (int, error) {
 			var leaders []int
 
 			for _, node := range nodes {
-				if node.GetState() == raft.Leader {
+				if node.GetState() == raft.Leader && !node.TestIsPartitioned {
 					leaderCount++
 					leaders = append(leaders, int(node.ID))
 				}

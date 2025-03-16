@@ -12,79 +12,65 @@ func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.State == Dead {
+	if r.TestIsPartitioned {
 		return nil, nil
 	}
 
-	isHeartbeat := false
-	if len(req.Entries) == 0 {
-		isHeartbeat = true
-	} else {
-		slog.Info("received append entries", "entries", len(req.Entries))
+	// Update term if needed
+	if req.Term > r.CurrentTerm {
+		r.CurrentTerm = req.Term
+		r.State = Follower
+		r.VotedFor = -1
 	}
 
-	entries := make([]*LogEntry, len(req.Entries))
-	for i, entry := range req.Entries {
-		entries[i] = &LogEntry{
-			Command: entry.Command,
-			Term:    entry.Term,
-			Index:   entry.Index,
-		}
-	}
+	// Update heartbeat
 	r.lastHeartbeat = time.Now()
 	r.LeaderID = req.LeaderID
 
+	// Reject if term is lower
 	if req.Term < r.CurrentTerm {
-		return &proto.AppendEntriesResponse{
-			Term:    r.CurrentTerm,
-			Success: false,
-		}, nil
+		return &proto.AppendEntriesResponse{Term: r.CurrentTerm, Success: false}, nil
 	}
 
-	if req.Term > r.CurrentTerm {
-		slog.Warn("higher term in request than currently")
-		r.CurrentTerm = req.Term
-		r.VotedFor = -1
-		r.State = Follower
-		return nil, nil
+	// Check log consistency
+	if req.PrevLogIndex >= int32(len(r.log)) {
+		slog.Info("rejecting entries: missing previous entries",
+			"prevLogIndex", req.PrevLogIndex,
+			"logLen", len(r.log))
+		return &proto.AppendEntriesResponse{Term: r.CurrentTerm, Success: false}, nil
 	}
 
-	if isHeartbeat {
-		return &proto.AppendEntriesResponse{
-			Term:    r.CurrentTerm,
-			Success: true,
-		}, nil
+	// Handle empty log special case
+	if req.PrevLogIndex == -1 {
+		r.log = r.log[:0]
+	} else if r.log[req.PrevLogIndex].Term != req.PrevLogTerm {
+		// Term mismatch - remove conflicting entries
+		slog.Info("removing conflicting entries",
+			"prevLogIndex", req.PrevLogIndex,
+			"prevLogTerm", req.PrevLogTerm,
+			"logTerm", r.log[req.PrevLogIndex].Term)
+		r.log = r.log[:req.PrevLogIndex]
+		return &proto.AppendEntriesResponse{Term: r.CurrentTerm, Success: false}, nil
 	}
 
-	if len(r.log) > 0 && req.PrevLogIndex > 0 {
-		if r.log[req.PrevLogIndex].Term != req.PrevLogTerm {
-			slog.Warn("log term mismatch", "prevLogIndex.Term", r.log[req.PrevLogIndex].Term, "prevLogTerm", req.PrevLogTerm)
-
-			return &proto.AppendEntriesResponse{
-				Term:    r.CurrentTerm,
-				Success: false,
-			}, nil
-		} else {
-			// If an existing entry conflicts with a new one (same index
-			// but different terms), delete the existing entry and all that
-			// follow it (§5.3)
-			r.log = r.log[:req.PrevLogIndex+1]
-			r.log = append(r.log, entries...)
-			r.lastApplied = int32(len(r.log)) - 1
+	// Append new entries
+	if len(req.Entries) > 0 {
+		r.log = r.log[:req.PrevLogIndex+1]
+		for _, entry := range req.Entries {
+			r.log = append(r.log, &LogEntry{
+				Command: entry.Command,
+				Term:    entry.Term,
+				Index:   entry.Index,
+			})
 		}
-	} else {
-		r.log = entries
-		r.lastApplied = int32(len(r.log)) - 1
 	}
 
+	// Update commit index
 	if req.LeaderCommit > r.commitIndex {
 		r.commitIndex = min(req.LeaderCommit, int32(len(r.log)-1))
 	}
 
-	return &proto.AppendEntriesResponse{
-		Term:    r.CurrentTerm,
-		Success: true,
-	}, nil
+	return &proto.AppendEntriesResponse{Term: r.CurrentTerm, Success: true}, nil
 }
 
 // RequestVote implements the gRPC RequestVote method.
@@ -92,8 +78,33 @@ func (r *Raft) RequestVote(ctx context.Context, req *proto.RequestVoteRequest) (
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.State == Dead {
+	if r.TestIsPartitioned {
 		return nil, nil
+	}
+
+	slog.Info("received vote request",
+		"from", req.CandidateID,
+		"term", req.Term,
+		"my_term", r.CurrentTerm,
+		"my_log_len", len(r.log),
+		"candidate_last_idx", req.LastLogIndex)
+
+	// If our log is more up-to-date, reject the vote
+	if r.lastApplied > -1 { // Only check if we have entries
+		lastLogTerm := r.log[r.lastApplied].Term
+		if lastLogTerm > req.LastLogTerm ||
+			(lastLogTerm == req.LastLogTerm && r.lastApplied > req.LastLogIndex) {
+			return &proto.RequestVoteResponse{
+				Term:        r.CurrentTerm,
+				VoteGranted: false,
+			}, nil
+		}
+	}
+
+	// Reset our term if it's unreasonably high compared to others
+	if r.CurrentTerm > req.Term+100 && r.lastApplied < req.LastLogIndex {
+		r.CurrentTerm = req.Term
+		r.VotedFor = -1
 	}
 
 	if req.Term < r.CurrentTerm {
@@ -110,11 +121,20 @@ func (r *Raft) RequestVote(ctx context.Context, req *proto.RequestVoteRequest) (
 	}
 
 	if r.VotedFor == -1 || r.VotedFor == req.CandidateID {
-		r.VotedFor = req.CandidateID
-		return &proto.RequestVoteResponse{
-			Term:        r.CurrentTerm,
-			VoteGranted: true,
-		}, nil
+		lastLogTerm := int32(0)
+		if r.lastApplied >= 0 {
+			lastLogTerm = r.log[r.lastApplied].Term
+		}
+
+		if req.LastLogTerm > lastLogTerm ||
+			(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= r.lastApplied) {
+			r.VotedFor = req.CandidateID
+			r.lastHeartbeat = time.Now()
+			return &proto.RequestVoteResponse{
+				Term:        r.CurrentTerm,
+				VoteGranted: true,
+			}, nil
+		}
 	}
 
 	return &proto.RequestVoteResponse{
