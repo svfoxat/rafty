@@ -2,8 +2,9 @@ package rafty
 
 import (
 	"context"
-	"github.com/svfoxat/rafty/internal/raft"
 	"log/slog"
+
+	"github.com/svfoxat/rafty/internal/raft"
 )
 
 type Server struct {
@@ -31,6 +32,7 @@ func (s *Server) KV() *KVStore {
 }
 
 func (s *Server) Start(ctx context.Context, port int, raftPort int) error {
+	// use errorgroup
 	go s.raft.Start(ctx, "0.0.0.0", raftPort)
 
 	s.kv = NewKVStore(s.raft)

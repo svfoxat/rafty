@@ -38,7 +38,7 @@ func NewKVStore(r *raft.Raft) *KVStore {
 func (k *KVStore) Start() {
 	slog.Info("starting kv store")
 	go k.processCommits()
-	go k.TtlChecker()
+	go k.TTLChecker()
 }
 
 // processCommits is a goroutine that listens for new commits from the raft node
@@ -72,7 +72,7 @@ func (k *KVStore) processCommits() {
 	}
 }
 
-func (k *KVStore) TtlChecker() {
+func (k *KVStore) TTLChecker() {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	for {
 		if k.raft.State != raft.Leader {
