@@ -147,9 +147,13 @@ func (r *Raft) TestUnpartition(term int32) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.CurrentTerm = term
+	if term != -1 {
+		r.CurrentTerm = term
+	}
 	r.State = Candidate
 	r.TestIsPartitioned = false
+	r.VotedFor = -1
+	r.lastHeartbeat = time.Now()
 }
 
 // ElectionTimer runs the election timeout loop.

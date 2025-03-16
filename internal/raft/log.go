@@ -17,17 +17,17 @@ func (r *Raft) GetLogEntries() []*LogEntry {
 	return entries
 }
 
-func (r *Raft) Submit(command any) bool {
+func (r *Raft) Submit(command any) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if r.State != Leader {
-		return false
+		return nil
 	}
 
 	r.lastApplied = r.lastApplied + 1
 	r.log = append(r.log, &LogEntry{Command: command, Term: r.CurrentTerm, Index: r.lastApplied})
 
 	slog.Debug("log entry added", "term", r.CurrentTerm, "node", r.ID)
-	return true
+	return nil
 }
