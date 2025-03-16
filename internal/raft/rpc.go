@@ -27,6 +27,11 @@ func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 	r.lastHeartbeat = time.Now()
 	r.LeaderID = req.LeaderID
 
+	// Update commit index
+	if req.LeaderCommit > r.commitIndex {
+		r.commitIndex = min(req.LeaderCommit, int32(len(r.log)-1))
+	}
+
 	// Reject if term is lower
 	if req.Term < r.CurrentTerm {
 		return &proto.AppendEntriesResponse{Term: r.CurrentTerm, Success: false}, nil
@@ -50,6 +55,7 @@ func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 			"prevLogTerm", req.PrevLogTerm,
 			"logTerm", r.log[req.PrevLogIndex].Term)
 		r.log = r.log[:req.PrevLogIndex]
+
 		return &proto.AppendEntriesResponse{Term: r.CurrentTerm, Success: false}, nil
 	}
 
@@ -65,9 +71,11 @@ func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 		}
 	}
 
-	// Update commit index
-	if req.LeaderCommit > r.commitIndex {
-		r.commitIndex = min(req.LeaderCommit, int32(len(r.log)-1))
+	// update lastApplied
+	if len(r.log) > 0 {
+		r.lastApplied = r.log[len(r.log)-1].Index
+	} else {
+		r.lastApplied = -1
 	}
 
 	return &proto.AppendEntriesResponse{Term: r.CurrentTerm, Success: true}, nil
