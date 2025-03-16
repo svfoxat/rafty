@@ -1,9 +1,11 @@
 package raft
 
-import "log/slog"
+import (
+	"log/slog"
+)
 
 type LogEntry struct {
-	Command any
+	Command []byte
 	Term    int32
 	Index   int32
 }
@@ -17,16 +19,18 @@ func (r *Raft) GetLogEntries() []*LogEntry {
 	return entries
 }
 
-func (r *Raft) Submit(command any) error {
+func (r *Raft) Submit(command []byte) (int32, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if r.State != Leader {
-		return nil
+		return 0, nil
 	}
 
-	r.log = append(r.log, &LogEntry{Command: command, Term: r.CurrentTerm, Index: r.commitIndex + 1})
+	currentLen := int32(len(r.log))
 
-	slog.Info("log entry added", "term", r.CurrentTerm, "node", r.ID)
-	return nil
+	r.log = append(r.log, &LogEntry{Command: command, Term: r.CurrentTerm, Index: currentLen + 1})
+
+	slog.Info("leader submit", "term", r.CurrentTerm, "node", r.ID, "index", len(r.log))
+	return currentLen + 1, nil
 }

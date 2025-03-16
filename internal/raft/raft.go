@@ -66,7 +66,7 @@ func NewNode(id int32, peers []string) *Raft {
 		lastHeartbeat:     time.Now(),
 		nextIndex:         make(map[string]int32),
 		matchIndex:        make(map[string]int32),
-		commitIndex:       0,  // -1 means no log entry has been committed.
+		commitIndex:       -1, // -1 means no log entry has been committed.
 		lastApplied:       -1, // -1 means no log entry has been applied.
 		TestIsPartitioned: false,
 		commitReady:       make(chan struct{}, 100),
@@ -335,7 +335,7 @@ func (r *Raft) SendHeartbeats() {
 				serializedEntries := make([]*proto.LogEntry, len(entries))
 				for i, entry := range entries {
 					serializedEntries[i] = &proto.LogEntry{
-						Command: entry.Command.(string),
+						Command: entry.Command,
 						Term:    entry.Term,
 						Index:   entry.Index,
 					}

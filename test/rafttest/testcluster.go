@@ -56,7 +56,7 @@ func (tc *TestCluster) SubmitCommands(leaderID int, prefix string, count int) {
 	leader := tc.Nodes[leaderID]
 	for i := 0; i < count; i++ {
 		command := fmt.Sprintf("%s_%d", prefix, i)
-		err := leader.Submit(command) // Removed ctx parameter
+		_, err := leader.Submit(command) // Removed ctx parameter
 		require.NoError(tc.t, err, "failed to submit command %s", command)
 	}
 	tc.t.Logf("Submitted %d commands with prefix '%s' to leader %d", count, prefix, leaderID)

@@ -23,7 +23,7 @@ func TestStartup(t *testing.T) {
 // TestKeyValue tests the key-value store functionality.
 // It creates a cluster of 3 nodes, sets 100 key-value pairs
 // and checks if the data is replicated to all the followers.
-func TestKeyValue(t *testing.T) {
+func TestKeyValueMultiKeys(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -33,9 +33,16 @@ func TestKeyValue(t *testing.T) {
 	leader := CheckHealthyCluster(ctx, t, servers)
 
 	for i := 0; i < count; i++ {
-		servers[leader].KV().Set(fmt.Sprintf("key%d", i), fmt.Sprintf("value%d", i))
+		err := servers[leader].KV().Set(rafty.SetCommand{
+			Key:   fmt.Sprintf("key%d", i),
+			Value: fmt.Sprintf("value%d", i),
+			TTL:   0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(1000 * time.Millisecond)
 
 	for i := 0; i < count; i++ {
 		response, ok := servers[leader].KV().Get(fmt.Sprintf("key%d", i))
@@ -57,6 +64,73 @@ func TestKeyValue(t *testing.T) {
 			}
 			assert.Equal(t, fmt.Sprintf("value%d", j), response)
 		}
+	}
+}
+
+func TestKeyValueOneKey(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	servers := CreateCluster(ctx, t, 3)
+	leader := CheckHealthyCluster(ctx, t, servers)
+
+	err := servers[leader].KV().Set(rafty.SetCommand{
+		Key:   "key0",
+		Value: "value0",
+		TTL:   0,
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(1000 * time.Millisecond)
+
+	for i := 0; i < 1; i++ {
+		response, ok := servers[leader].KV().Get(fmt.Sprintf("key%d", i))
+		if ok != true {
+			t.Fatal("Error getting key", i)
+		}
+		assert.Equal(t, fmt.Sprintf("value%d", i), response)
+	}
+}
+
+func TestKeyValueDelete(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	servers := CreateCluster(ctx, t, 3)
+	leader := CheckHealthyCluster(ctx, t, servers)
+
+	err := servers[leader].KV().Set(rafty.SetCommand{
+		Key:   "key0",
+		Value: "value0",
+		TTL:   0,
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(1000 * time.Millisecond)
+
+	response, ok := servers[leader].KV().Get("key0")
+	if ok != true {
+		t.Fatal("Error getting key0")
+	}
+	assert.Equal(t, "value0", response)
+
+	err = servers[leader].KV().Delete(rafty.DeleteCommand{
+		Key: "key0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// get again, should fail
+	_, ok = servers[leader].KV().Get("key0")
+	if ok != false {
+		t.Fatal("Should not be able to get key0")
 	}
 }
 
