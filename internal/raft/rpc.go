@@ -29,6 +29,7 @@ func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 
 	// Update commit index
 	if req.LeaderCommit > r.commitIndex {
+		r.commitReady <- struct{}{}
 		r.commitIndex = min(req.LeaderCommit, int32(len(r.log)-1))
 	}
 
@@ -70,14 +71,6 @@ func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 			})
 		}
 	}
-
-	// update lastApplied
-	if len(r.log) > 0 {
-		r.lastApplied = r.log[len(r.log)-1].Index
-	} else {
-		r.lastApplied = -1
-	}
-
 	return &proto.AppendEntriesResponse{Term: r.CurrentTerm, Success: true}, nil
 }
 

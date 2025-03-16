@@ -3,13 +3,18 @@ package main
 import (
 	"context"
 	"flag"
-	"github.com/svfoxat/rafty/internal/raft"
+	"github.com/svfoxat/rafty/internal/rafty"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 func main() {
+	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer done()
+
 	// Set up default values from environment variables.
 	defaultID := os.Getenv("RAFTY_ID")
 	if defaultID == "" {
@@ -61,10 +66,13 @@ func main() {
 		peerList = strings.Split(peers, ",")
 	}
 
-	// Create a new Raft node with the specified ID and peers.
-	node := raft.NewNode(int32(id), peerList)
+	// Create a new Rafty Node
+	node := rafty.NewServer(&rafty.ServerConfig{
+		ID:    int32(id),
+		Peers: peerList,
+	})
 
-	err := node.Start(context.Background(), "0.0.0.0", port)
+	err := node.Start(ctx, port+1, port)
 	if err != nil {
 		panic(err)
 	}

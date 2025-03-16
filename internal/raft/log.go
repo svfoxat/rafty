@@ -25,9 +25,8 @@ func (r *Raft) Submit(command any) error {
 		return nil
 	}
 
-	r.lastApplied = r.lastApplied + 1
-	r.log = append(r.log, &LogEntry{Command: command, Term: r.CurrentTerm, Index: r.lastApplied})
+	r.log = append(r.log, &LogEntry{Command: command, Term: r.CurrentTerm, Index: r.commitIndex + 1})
 
-	slog.Debug("log entry added", "term", r.CurrentTerm, "node", r.ID)
+	slog.Info("log entry added", "term", r.CurrentTerm, "node", r.ID)
 	return nil
 }

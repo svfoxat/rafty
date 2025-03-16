@@ -35,6 +35,9 @@ type Raft struct {
 
 	lastHeartbeat time.Time
 
+	commitReady chan struct{}
+	commitSubs  []chan *LogEntry
+
 	// persistent
 	log         []*LogEntry
 	CurrentTerm int32
@@ -66,6 +69,7 @@ func NewNode(id int32, peers []string) *Raft {
 		commitIndex:       0,  // -1 means no log entry has been committed.
 		lastApplied:       -1, // -1 means no log entry has been applied.
 		TestIsPartitioned: false,
+		commitReady:       make(chan struct{}, 100),
 	}
 }
 
@@ -87,6 +91,7 @@ func (r *Raft) Start(ctx context.Context, addr string, port int) error {
 
 	// Start the election timer in a separate goroutine.
 	go r.ElectionTimer()
+	go r.commitReadyLoop()
 
 	// Channel to capture server errors.
 	errCh := make(chan error, 1)
@@ -122,6 +127,15 @@ func (r *Raft) Start(ctx context.Context, addr string, port int) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+func (r *Raft) Subscribe() chan *LogEntry {
+	slog.Info("node subscribed to commits", "node", r.ID)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ch := make(chan *LogEntry, 100)
+	r.commitSubs = append(r.commitSubs, ch)
+	return ch
 }
 
 // GetState returns the current state of the Raft node.
@@ -360,6 +374,7 @@ func (r *Raft) SendHeartbeats() {
 					r.matchIndex[addr] = r.nextIndex[addr] - 1
 
 					// Update commit index if needed
+					savedCommitIndex := r.commitIndex
 					if len(entries) > 0 {
 						for n := r.commitIndex + 1; n < int32(len(r.log)); n++ {
 							if r.log[n].Term == currentTerm {
@@ -373,6 +388,10 @@ func (r *Raft) SendHeartbeats() {
 									r.commitIndex = n
 								}
 							}
+						}
+						if r.commitIndex != savedCommitIndex {
+							slog.Info("leader commit", "node", r.ID, "term", currentTerm, "index", r.commitIndex)
+							r.commitReady <- struct{}{}
 						}
 					}
 				} else {
@@ -391,5 +410,34 @@ func (r *Raft) SendHeartbeats() {
 			}(peerAddr)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func (r *Raft) commitReadyLoop() {
+	for {
+		select {
+		case <-r.commitReady:
+			r.mu.Lock()
+			slog.Info("commit ready", "node", r.ID, "term", r.CurrentTerm, "commitIndex", r.commitIndex)
+
+			//savedTerm := r.CurrentTerm
+			//savedLastApplied := int32(0)
+
+			var entries []*LogEntry
+			if r.lastApplied == -1 {
+				entries = r.log
+				r.lastApplied = r.commitIndex
+			} else if r.commitIndex > r.lastApplied {
+				entries = r.log[r.lastApplied+1 : r.commitIndex+1]
+				r.lastApplied = r.commitIndex
+			}
+			r.mu.Unlock()
+
+			for _, entry := range entries {
+				for _, ch := range r.commitSubs {
+					ch <- entry
+				}
+			}
+		}
 	}
 }
