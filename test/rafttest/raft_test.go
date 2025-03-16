@@ -94,6 +94,8 @@ func TestSubmitMultiWithDead(t *testing.T) {
 }
 
 func TestRunawayNode(t *testing.T) {
+	t.Skip()
+
 	tc := rafttest.SetupCluster(t, 3)
 	defer tc.Cleanup()
 

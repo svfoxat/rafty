@@ -7,6 +7,7 @@ import (
 	"github.com/svfoxat/rafty/internal/raft"
 	"github.com/svfoxat/rafty/internal/rafty"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -45,7 +46,84 @@ func TestKeyValueMultiKeys(t *testing.T) {
 		if ok != true {
 			t.Fatal("Error getting key", i)
 		}
-		assert.Equal(t, fmt.Sprintf("value%d", i), response)
+		assert.Equal(t, fmt.Sprintf("value%d", i), string(response))
+	}
+}
+
+func TestKeyValueMultiKeysConcurrent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	count := 1000      // More entries to better test concurrency
+	concurrency := 100 // Fewer goroutines for more stability
+	entriesPerGoroutine := count / concurrency
+
+	servers := CreateCluster(ctx, t, 3)
+	leader := CheckHealthyCluster(ctx, t, servers)
+
+	// Channel to collect errors from goroutines
+	errCh := make(chan error, concurrency)
+
+	var wg sync.WaitGroup
+	for c := 0; c < concurrency; c++ {
+		wg.Add(1)
+		go func(offset int) {
+			defer wg.Done()
+			for i := 0; i < entriesPerGoroutine; i++ {
+				key := offset*entriesPerGoroutine + i
+				err := servers[leader].KV().Set(rafty.SetCommand{
+					Key:   fmt.Sprintf("key%d", key),
+					Value: fmt.Sprintf("value%d", key),
+					TTL:   0,
+				})
+				if err != nil {
+					errCh <- fmt.Errorf("offset %d, key %d: %w", offset, key, err)
+					return
+				}
+			}
+		}(c)
+	}
+
+	// Wait for all writes and check for errors
+	go func() {
+		wg.Wait()
+		close(errCh)
+	}()
+
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	// Give cluster time to replicate
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify all entries
+	verifyWg := sync.WaitGroup{}
+	verifyErrors := make(chan error, count)
+
+	for i := 0; i < count; i++ {
+		verifyWg.Add(1)
+		go func(key int) {
+			defer verifyWg.Done()
+			response, ok := servers[leader].KV().Get(fmt.Sprintf("key%d", key))
+			if !ok {
+				verifyErrors <- fmt.Errorf("key%d not found", key)
+				return
+			}
+			expected := fmt.Sprintf("value%d", key)
+			if string(response) != expected {
+				verifyErrors <- fmt.Errorf("key%d: expected %s, got %s", key, expected, string(response))
+			}
+		}(i)
+	}
+
+	go func() {
+		verifyWg.Wait()
+		close(verifyErrors)
+	}()
+
+	for err := range verifyErrors {
+		t.Error(err)
 	}
 }
 
@@ -73,7 +151,7 @@ func TestKeyValueOneKey(t *testing.T) {
 		if ok != true {
 			t.Fatal("Error getting key", i)
 		}
-		assert.Equal(t, fmt.Sprintf("value%d", i), response)
+		assert.Equal(t, fmt.Sprintf("value%d", i), string(response))
 	}
 }
 
@@ -100,7 +178,7 @@ func TestKeyValueDelete(t *testing.T) {
 	if ok != true {
 		t.Fatal("Error getting key0")
 	}
-	assert.Equal(t, "value0", response)
+	assert.Equal(t, "value0", string(response))
 
 	err = servers[leader].KV().Delete(rafty.DeleteCommand{
 		Key: "key0",
@@ -118,6 +196,7 @@ func TestKeyValueDelete(t *testing.T) {
 
 func CreateCluster(ctx context.Context, t *testing.T, nodeCount int) []*rafty.Server {
 	peers := make([]string, nodeCount)
+
 	for i := 0; i < nodeCount; i++ {
 		peers[i] = "127.0.0.1:" + strconv.Itoa(12345+i)
 	}

@@ -5,10 +5,12 @@ import (
 	"github.com/svfoxat/rafty/internal/raft"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 )
 
 type KVStore struct {
+	mu   sync.RWMutex
 	raft *raft.Raft
 
 	// preliminary in-memory store
@@ -18,13 +20,13 @@ type KVStore struct {
 }
 
 type StoreEntry struct {
-	Value string
+	Value []byte
 }
 
 func NewKVStore(r *raft.Raft) *KVStore {
 	return &KVStore{
 		raft:          r,
-		entryCommited: make(chan int32, 1000),
+		entryCommited: make(chan int32, 10000),
 		store:         make(map[string]*StoreEntry),
 	}
 }
@@ -45,20 +47,28 @@ func (k *KVStore) processCommits() {
 		switch cmdSplit[0] {
 		case "SET":
 			//slog.Info("SET", "key", cmdSplit[1], "value", cmdSplit[2], "node", k.raft.ID)
-			k.store[cmdSplit[1]] = &StoreEntry{cmdSplit[2]}
+			k.mu.Lock()
+			k.store[cmdSplit[1]] = &StoreEntry{[]byte(cmdSplit[2])}
 			k.entryCommited <- entry.Index
+			k.mu.Unlock()
+
 		case "DEL":
 			//slog.Info("DEL", "key", cmdSplit[1], "node", k.raft.ID)
+			k.mu.Lock()
 			delete(k.store, cmdSplit[1])
 			k.entryCommited <- entry.Index
+			k.mu.Unlock()
 		}
 	}
 }
 
-func (k *KVStore) Get(key string) (string, bool) {
+func (k *KVStore) Get(key string) ([]byte, bool) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+
 	storeEntry, ok := k.store[key]
 	if !ok {
-		return "", false
+		return []byte{}, false
 	}
 	return storeEntry.Value, true
 }
@@ -85,13 +95,22 @@ func (k *KVStore) Set(cmd SetCommand) error {
 	for {
 		select {
 		case <-timer.C:
-			return fmt.Errorf("timeout waiting for commit")
-		case id := <-k.entryCommited:
-			if id == index {
+			k.mu.RLock()
+			// Double check if command was actually committed
+			if _, ok := k.store[cmd.Key]; ok {
+				k.mu.RUnlock()
 				return nil
-			} else if id > index {
-				// Check if our command was already committed
-				if _, ok := k.store[cmd.Key]; ok {
+			}
+			k.mu.RUnlock()
+			return fmt.Errorf("timeout waiting for commit")
+
+		case id := <-k.entryCommited:
+			if id >= index {
+				// Verify the key exists
+				k.mu.RLock()
+				_, ok := k.store[cmd.Key]
+				k.mu.RUnlock()
+				if ok {
 					return nil
 				}
 			}
