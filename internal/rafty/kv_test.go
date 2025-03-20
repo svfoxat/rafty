@@ -26,23 +26,26 @@ func TestKeyValueMultiKeys(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	count := 200
+	count := 1000
 
 	servers := CreateCluster(ctx, 3)
 	leader := CheckHealthyCluster(ctx, servers)
 	t.Logf("%d is the leader", leader)
 
 	for i := 0; i < count; i++ {
-		_, err := servers[leader].KV().Set(rafty.SetCommand{
-			Key:   fmt.Sprintf("key%d", i),
-			Value: fmt.Sprintf("value%d", i),
-			TTL:   0,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		go func() {
+			err := servers[leader].KV().Set(rafty.SetCommand{
+				Key:   fmt.Sprintf("key%d", i),
+				Value: fmt.Sprintf("value%d", i),
+				TTL:   0,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}()
 	}
 
+	time.Sleep(50 * time.Millisecond)
 	for i := 0; i < count; i++ {
 		response, ok := servers[leader].KV().Get(fmt.Sprintf("key%d", i))
 		if ok != true {
