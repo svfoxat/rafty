@@ -17,9 +17,9 @@ func TestStartup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	servers := CreateCluster(ctx, t, 3)
-	leader := CheckHealthyCluster(ctx, t, servers)
-	t.Log(leader)
+	servers := CreateCluster(ctx, 3)
+	leader := CheckHealthyCluster(ctx, servers)
+	t.Logf("%d is the leader", leader)
 }
 
 func TestKeyValueMultiKeys(t *testing.T) {
@@ -28,11 +28,12 @@ func TestKeyValueMultiKeys(t *testing.T) {
 
 	count := 200
 
-	servers := CreateCluster(ctx, t, 3)
-	leader := CheckHealthyCluster(ctx, t, servers)
+	servers := CreateCluster(ctx, 3)
+	leader := CheckHealthyCluster(ctx, servers)
+	t.Logf("%d is the leader", leader)
 
 	for i := 0; i < count; i++ {
-		err := servers[leader].KV().Set(rafty.SetCommand{
+		_, err := servers[leader].KV().Set(rafty.SetCommand{
 			Key:   fmt.Sprintf("key%d", i),
 			Value: fmt.Sprintf("value%d", i),
 			TTL:   0,
@@ -57,11 +58,12 @@ func TestKeyValueMultiKeysTtl(t *testing.T) {
 
 	count := 100
 
-	servers := CreateCluster(ctx, t, 3)
-	leader := CheckHealthyCluster(ctx, t, servers)
+	servers := CreateCluster(ctx, 3)
+	leader := CheckHealthyCluster(ctx, servers)
+	t.Logf("%d is the leader", leader)
 
 	for i := 0; i < count; i++ {
-		err := servers[leader].KV().Set(rafty.SetCommand{
+		_, err := servers[leader].KV().Set(rafty.SetCommand{
 			Key:   fmt.Sprintf("key%d", i),
 			Value: fmt.Sprintf("value%d", i),
 			TTL:   int32(rand.Intn(10-5) + 5),
@@ -89,8 +91,9 @@ func TestKeyValueMultiKeysConcurrent(t *testing.T) {
 	concurrency := 100 // Fewer goroutines for more stability
 	entriesPerGoroutine := count / concurrency
 
-	servers := CreateCluster(ctx, t, 3)
-	leader := CheckHealthyCluster(ctx, t, servers)
+	servers := CreateCluster(ctx, 3)
+	leader := CheckHealthyCluster(ctx, servers)
+	t.Logf("%d is the leader", leader)
 
 	// Channel to collect errors from goroutines
 	errCh := make(chan error, concurrency)
@@ -102,7 +105,7 @@ func TestKeyValueMultiKeysConcurrent(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < entriesPerGoroutine; i++ {
 				key := offset*entriesPerGoroutine + i
-				err := servers[leader].KV().Set(rafty.SetCommand{
+				response, err := servers[leader].KV().Set(rafty.SetCommand{
 					Key:   fmt.Sprintf("key%d", key),
 					Value: fmt.Sprintf("value%d", key),
 					TTL:   0,
@@ -111,6 +114,7 @@ func TestKeyValueMultiKeysConcurrent(t *testing.T) {
 					errCh <- fmt.Errorf("offset %d, key %d: %w", offset, key, err)
 					return
 				}
+				t.Logf("set success with idx=%d in %dms", response.Index, response.Duration.Milliseconds())
 			}
 		}(c)
 	}
@@ -162,20 +166,19 @@ func TestKeyValueOneKey(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	servers := CreateCluster(ctx, t, 3)
-	leader := CheckHealthyCluster(ctx, t, servers)
+	servers := CreateCluster(ctx, 3)
+	leader := CheckHealthyCluster(ctx, servers)
+	t.Logf("%d is the leader", leader)
 
-	err := servers[leader].KV().Set(rafty.SetCommand{
+	response, err := servers[leader].KV().Set(rafty.SetCommand{
 		Key:   "key0",
 		Value: "value0",
 		TTL:   0,
 	})
-
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	time.Sleep(1000 * time.Millisecond)
+	t.Logf("set success with idx=%d in %dms", response.Index, response.Duration.Milliseconds())
 
 	for i := 0; i < 1; i++ {
 		response, ok := servers[leader].KV().Get(fmt.Sprintf("key%d", i))
@@ -190,10 +193,11 @@ func TestKeyValueDelete(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	servers := CreateCluster(ctx, t, 3)
-	leader := CheckHealthyCluster(ctx, t, servers)
+	servers := CreateCluster(ctx, 3)
+	leader := CheckHealthyCluster(ctx, servers)
+	t.Logf("%d is the leader", leader)
 
-	err := servers[leader].KV().Set(rafty.SetCommand{
+	_, err := servers[leader].KV().Set(rafty.SetCommand{
 		Key:   "key0",
 		Value: "value0",
 		TTL:   0,
@@ -225,7 +229,29 @@ func TestKeyValueDelete(t *testing.T) {
 	}
 }
 
-func CreateCluster(ctx context.Context, t *testing.T, nodeCount int) []*rafty.Server {
+func BenchmarkKVStore_Set(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	servers := CreateCluster(ctx, 3)
+	leader := CheckHealthyCluster(ctx, servers)
+	b.Logf("%d is the leader", leader)
+	b.ResetTimer()
+
+	for b.Loop() {
+		response, err := servers[leader].KV().Set(rafty.SetCommand{
+			Key:   "key0",
+			Value: "value0",
+			TTL:   0,
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Logf("set success with idx=%d in %d", response.Index, response.Duration.Microseconds())
+	}
+}
+
+func CreateCluster(ctx context.Context, nodeCount int) []*rafty.Server {
 	peers := make([]string, nodeCount)
 
 	for i := 0; i < nodeCount; i++ {
@@ -245,18 +271,17 @@ func CreateCluster(ctx context.Context, t *testing.T, nodeCount int) []*rafty.Se
 	return servers
 }
 
-func CheckHealthyCluster(ctx context.Context, t *testing.T, servers []*rafty.Server) int {
+func CheckHealthyCluster(ctx context.Context, servers []*rafty.Server) int32 {
 	timeout := time.NewTimer(5 * time.Second)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	for {
 		select {
 		case <-timeout.C:
-			t.Fatal("Timeout waiting for leader")
+			panic("Timeout waiting for leader")
 		case <-ticker.C:
-			for i, srv := range servers {
+			for _, srv := range servers {
 				if srv.Status().State == raft.Leader {
-					t.Logf("Server %d is the leader", srv.Status().ID)
-					return i
+					return srv.Status().ID
 				}
 			}
 		}

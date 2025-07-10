@@ -38,7 +38,7 @@ func NewKVStore(r *raft.Raft) *KVStore {
 func (k *KVStore) Start() {
 	slog.Info("starting kv store")
 	go k.processCommits()
-	go k.TTLChecker()
+	//go k.TTLChecker()
 }
 
 // processCommits is a goroutine that listens for new commits from the raft node
@@ -123,17 +123,23 @@ type SetCommand struct {
 	TTL   int32
 }
 
-func (k *KVStore) Set(cmd SetCommand) error {
+type SetCommandResponse struct {
+	Index    int32
+	Duration time.Duration
+}
+
+func (k *KVStore) Set(cmd SetCommand) (*SetCommandResponse, error) {
 	if k.raft.State != raft.Leader {
-		return fmt.Errorf("not leader")
+		return nil, fmt.Errorf("not leader")
 	}
 
-	index, err := k.raft.Submit([]byte(fmt.Sprintf("SET %s %s %d", cmd.Key, cmd.Value, cmd.TTL)))
+	start := time.Now()
+	index, err := k.raft.Propose([]byte(fmt.Sprintf("SET %s %s %d", cmd.Key, cmd.Value, cmd.TTL)))
 	if err != nil {
-		return fmt.Errorf("error submitting command: %v", err)
+		return nil, fmt.Errorf("error submitting command: %v", err)
 	}
 
-	timer := time.NewTimer(1 * time.Second)
+	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 
 	for {
@@ -143,10 +149,10 @@ func (k *KVStore) Set(cmd SetCommand) error {
 			// Double check if command was actually committed
 			if _, ok := k.store[cmd.Key]; ok {
 				k.mu.RUnlock()
-				return nil
+				return &SetCommandResponse{Index: index, Duration: time.Since(start)}, nil
 			}
 			k.mu.RUnlock()
-			return fmt.Errorf("timeout waiting for commit")
+			return nil, fmt.Errorf("timeout waiting for commit")
 
 		case id := <-k.entryCommited:
 			if id >= index {
@@ -155,7 +161,7 @@ func (k *KVStore) Set(cmd SetCommand) error {
 				_, ok := k.store[cmd.Key]
 				k.mu.RUnlock()
 				if ok {
-					return nil
+					return &SetCommandResponse{Index: index, Duration: time.Since(start)}, nil
 				}
 			}
 		}

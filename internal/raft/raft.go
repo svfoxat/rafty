@@ -52,6 +52,13 @@ type Raft struct {
 	matchIndex map[string]int32 // index of highest log entry of each follower known to be replicated
 
 	TestIsPartitioned bool
+
+	// grpc client map
+	connMu   sync.Mutex
+	peerCons map[string]proto.RaftServiceClient
+
+	// log batching
+	proposeCh chan *LogEntry
 }
 
 // NewNode creates a new Raft node with a given ID and list of peer addresses.
@@ -70,6 +77,8 @@ func NewNode(id int32, peers []string) *Raft {
 		lastApplied:       -1, // -1 means no log entry has been applied.
 		TestIsPartitioned: false,
 		commitReady:       make(chan struct{}, 10000), // this is a bottleneck in high concurrency
+		peerCons:          make(map[string]proto.RaftServiceClient),
+		proposeCh:         make(chan *LogEntry, 1000), //  for batching
 	}
 }
 
@@ -92,6 +101,7 @@ func (r *Raft) Start(ctx context.Context, addr string, port int) error {
 	// Start the election timer in a separate goroutine.
 	go r.ElectionTimer()
 	go r.commitReadyLoop()
+	go r.logBatcher()
 
 	// Channel to capture server errors.
 	errCh := make(chan error, 1)
@@ -280,6 +290,101 @@ func (r *Raft) StartElection() {
 	}
 }
 
+func (r *Raft) ReplicateLog() {
+	r.mu.Lock()
+	if r.State != Leader || r.TestIsPartitioned {
+		r.mu.Unlock()
+		return
+	}
+	currentTerm := r.CurrentTerm
+	prevCommitIndex := r.commitIndex
+	r.mu.Unlock()
+
+	// Track majority responses for each index
+	responses := make(map[int32]int)
+	var wg sync.WaitGroup
+
+	for _, peerAddr := range r.Peers {
+		if peerAddr == r.myAddr {
+			continue
+		}
+
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+
+			r.mu.Lock()
+			prevLogIndex := r.nextIndex[addr] - 1
+			var entries []*LogEntry
+			if prevLogIndex < int32(len(r.log)) {
+				entries = r.log[prevLogIndex+1:]
+			}
+
+			prevLogTerm := int32(-1)
+			if prevLogIndex >= 0 && prevLogIndex < int32(len(r.log)) {
+				prevLogTerm = r.log[prevLogIndex].Term
+			}
+
+			req := &proto.AppendEntriesRequest{
+				Term:         currentTerm,
+				LeaderID:     r.ID,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      convertLogEntries(entries),
+				LeaderCommit: r.commitIndex,
+			}
+			r.mu.Unlock()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+
+			resp, err := r.sendAppendEntries(ctx, addr, req)
+			if err != nil {
+				return
+			}
+
+			r.mu.Lock()
+			if resp.Success {
+				r.nextIndex[addr] = prevLogIndex + int32(len(entries)) + 1
+				r.matchIndex[addr] = r.nextIndex[addr] - 1
+
+				// Track successful response for each index
+				for n := prevCommitIndex + 1; n <= r.matchIndex[addr]; n++ {
+					if n < int32(len(r.log)) && r.log[n].Term == currentTerm {
+						responses[n]++
+					}
+				}
+			} else {
+				if r.nextIndex[addr] > 0 {
+					r.nextIndex[addr]--
+				}
+			}
+			r.mu.Unlock()
+		}(peerAddr)
+	}
+
+	wg.Wait()
+
+	// Update commit index with all responses
+	r.mu.Lock()
+	if r.State == Leader && r.CurrentTerm == currentTerm {
+		for n := prevCommitIndex + 1; n < int32(len(r.log)); n++ {
+			if r.log[n].Term == currentTerm && responses[n]+1 > len(r.Peers)/2 {
+				r.commitIndex = n
+				select {
+				case r.commitReady <- struct{}{}:
+				default:
+					// Ensure commit notification
+					go func() {
+						r.commitReady <- struct{}{}
+					}()
+				}
+			}
+		}
+	}
+	r.mu.Unlock()
+}
+
 // SendHeartbeats sends periodic AppendEntries RPCs (heartbeats) to all peers.
 // When a follower receives these, it resets its lastHeartbeat.
 func (r *Raft) SendHeartbeats() {
@@ -298,98 +403,8 @@ func (r *Raft) SendHeartbeats() {
 	for {
 		select {
 		case <-ticker.C:
-			r.mu.Lock()
-			if r.State != Leader || r.TestIsPartitioned {
-				r.mu.Unlock()
-				return
-			}
-			currentTerm := r.CurrentTerm
-			prevCommitIndex := r.commitIndex
-			r.mu.Unlock()
-
-			// Track majority responses for each index
-			responses := make(map[int32]int)
-			var wg sync.WaitGroup
-
-			for _, peerAddr := range r.Peers {
-				if peerAddr == r.myAddr {
-					continue
-				}
-
-				wg.Add(1)
-				go func(addr string) {
-					defer wg.Done()
-
-					r.mu.Lock()
-					prevLogIndex := r.nextIndex[addr] - 1
-					var entries []*LogEntry
-					if prevLogIndex < int32(len(r.log)) {
-						entries = r.log[prevLogIndex+1:]
-					}
-
-					prevLogTerm := int32(-1)
-					if prevLogIndex >= 0 && prevLogIndex < int32(len(r.log)) {
-						prevLogTerm = r.log[prevLogIndex].Term
-					}
-
-					req := &proto.AppendEntriesRequest{
-						Term:         currentTerm,
-						LeaderID:     r.ID,
-						PrevLogIndex: prevLogIndex,
-						PrevLogTerm:  prevLogTerm,
-						Entries:      convertLogEntries(entries),
-						LeaderCommit: r.commitIndex,
-					}
-					r.mu.Unlock()
-
-					ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-					defer cancel()
-
-					resp, err := r.sendAppendEntries(ctx, addr, req)
-					if err != nil {
-						return
-					}
-
-					r.mu.Lock()
-					if resp.Success {
-						r.nextIndex[addr] = prevLogIndex + int32(len(entries)) + 1
-						r.matchIndex[addr] = r.nextIndex[addr] - 1
-
-						// Track successful response for each index
-						for n := prevCommitIndex + 1; n <= r.matchIndex[addr]; n++ {
-							if n < int32(len(r.log)) && r.log[n].Term == currentTerm {
-								responses[n]++
-							}
-						}
-					} else {
-						if r.nextIndex[addr] > 0 {
-							r.nextIndex[addr]--
-						}
-					}
-					r.mu.Unlock()
-				}(peerAddr)
-			}
-
-			wg.Wait()
-
-			// Update commit index with all responses
-			r.mu.Lock()
-			if r.State == Leader && r.CurrentTerm == currentTerm {
-				for n := prevCommitIndex + 1; n < int32(len(r.log)); n++ {
-					if r.log[n].Term == currentTerm && responses[n]+1 > len(r.Peers)/2 {
-						r.commitIndex = n
-						select {
-						case r.commitReady <- struct{}{}:
-						default:
-							// Ensure commit notification
-							go func() {
-								r.commitReady <- struct{}{}
-							}()
-						}
-					}
-				}
-			}
-			r.mu.Unlock()
+			r.ReplicateLog()
+			break
 		}
 	}
 }
@@ -407,13 +422,23 @@ func convertLogEntries(entries []*LogEntry) []*proto.LogEntry {
 }
 
 func (r *Raft) sendAppendEntries(ctx context.Context, addr string, req *proto.AppendEntriesRequest) (*proto.AppendEntriesResponse, error) {
-	conn, err := grpc.DialContext(ctx, addr, grpc.WithInsecure(), grpc.WithBlock())
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
+	r.connMu.Lock()
+	client, ok := r.peerCons[addr]
+	r.connMu.Unlock()
 
-	client := proto.NewRaftServiceClient(conn)
+	if !ok {
+		conn, err := grpc.DialContext(ctx, addr, grpc.WithInsecure(), grpc.WithBlock())
+		if err != nil {
+			return nil, err
+		}
+		protoClient := proto.NewRaftServiceClient(conn)
+
+		r.connMu.Lock()
+		r.peerCons[addr] = protoClient
+		r.connMu.Unlock()
+
+		client = protoClient
+	}
 	return client.AppendEntries(ctx, req)
 }
 
@@ -422,11 +447,6 @@ func (r *Raft) commitReadyLoop() {
 		select {
 		case <-r.commitReady:
 			r.mu.Lock()
-			slog.Info("commit ready", "node", r.ID, "term", r.CurrentTerm, "commitIndex", r.commitIndex)
-
-			//savedTerm := r.CurrentTerm
-			//savedLastApplied := int32(0)
-
 			var entries []*LogEntry
 			if r.lastApplied == -1 {
 				entries = r.log
