@@ -3,14 +3,15 @@ package rafty_test
 import (
 	"context"
 	"fmt"
-	"github.com/stretchr/testify/assert"
-	"github.com/svfoxat/rafty/internal/raft"
-	"github.com/svfoxat/rafty/internal/rafty"
 	"math/rand"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/svfoxat/rafty/internal/raft"
+	"github.com/svfoxat/rafty/internal/rafty"
 )
 
 func TestStartup(t *testing.T) {
@@ -26,10 +27,10 @@ func TestSingleNodeSingleWrite(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	servers := CreateCluster(ctx, t, 1)
-	leader := CheckHealthyCluster(ctx, t, servers)
+	servers := CreateCluster(ctx, 1)
+	leader := CheckHealthyCluster(ctx, servers)
 
-	err := servers[leader].KV().Set(rafty.SetCommand{
+	err, _ := servers[leader].KV().Set(rafty.SetCommand{
 		Key:   "key",
 		Value: "value",
 		TTL:   0,
@@ -60,7 +61,7 @@ func TestKeyValueMultiKeys(t *testing.T) {
 
 	for i := 0; i < count; i++ {
 		go func() {
-			err := servers[leader].KV().Set(rafty.SetCommand{
+			err, _ := servers[leader].KV().Set(rafty.SetCommand{
 				Key:   fmt.Sprintf("key%d", i),
 				Value: fmt.Sprintf("value%d", i),
 				TTL:   0,
