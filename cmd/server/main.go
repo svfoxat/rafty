@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"flag"
-	"github.com/svfoxat/rafty/internal/rafty"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/svfoxat/rafty/internal/rafty"
 )
 
 func main() {
@@ -66,14 +68,21 @@ func main() {
 		peerList = strings.Split(peers, ",")
 	}
 
+	logger := setupLogger(id)
+
 	// Create a new Rafty Node
 	node := rafty.NewServer(&rafty.ServerConfig{
-		ID:    int32(id),
-		Peers: peerList,
+		ID:     int32(id),
+		Peers:  peerList,
+		Logger: logger,
 	})
 
 	err := node.Start(ctx, port+1, port)
 	if err != nil {
 		panic(err)
 	}
+}
+
+func setupLogger(id int) *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stdout, nil))
 }

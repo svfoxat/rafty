@@ -22,6 +22,32 @@ func TestStartup(t *testing.T) {
 	t.Logf("%d is the leader", leader)
 }
 
+func TestSingleNodeSingleWrite(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	servers := CreateCluster(ctx, t, 1)
+	leader := CheckHealthyCluster(ctx, t, servers)
+
+	err := servers[leader].KV().Set(rafty.SetCommand{
+		Key:   "key",
+		Value: "value",
+		TTL:   0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(1000 * time.Millisecond)
+	t.Log("GET")
+
+	response, ok := servers[leader].KV().Get("key")
+	if ok != true {
+		t.Fatal("Error getting key")
+	}
+	assert.Equal(t, "value", string(response))
+}
+
 func TestKeyValueMultiKeys(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

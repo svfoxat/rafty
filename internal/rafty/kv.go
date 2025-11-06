@@ -2,21 +2,22 @@ package rafty
 
 import (
 	"fmt"
-	"github.com/svfoxat/rafty/internal/raft"
 	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/vfs"
+	"github.com/svfoxat/rafty/internal/raft"
 )
 
 type KVStore struct {
 	mu   sync.RWMutex
 	raft *raft.Raft
 
-	// preliminary in-memory store
-	// TODO: maybe a sync.Map would be better suited
-	store map[string]*StoreEntry
+	db *pebble.DB
 
 	entryCommited chan int32
 }
@@ -27,18 +28,23 @@ type StoreEntry struct {
 	insertedAt time.Time
 }
 
-func NewKVStore(r *raft.Raft) *KVStore {
+func NewKVStore(r *raft.Raft) (*KVStore, error) {
+	db, err := pebble.Open("kvstore", &pebble.Options{FS: vfs.NewMem()})
+	if err != nil {
+		return nil, err
+	}
+
 	return &KVStore{
 		raft:          r,
 		entryCommited: make(chan int32, 10000), // this is a bottleneck in high concurrency
-		store:         make(map[string]*StoreEntry),
-	}
+		db:            db,
+	}, nil
 }
 
 func (k *KVStore) Start() {
 	slog.Info("starting kv store")
 	go k.processCommits()
-	//go k.TTLChecker()
+	// go k.TTLChecker()
 }
 
 // processCommits is a goroutine that listens for new commits from the raft node
@@ -58,63 +64,36 @@ func (k *KVStore) processCommits() {
 				slog.Error("error parsing ttl", "ttl", cmdSplit[3])
 				continue
 			}
-			k.mu.Lock()
-			k.store[cmdSplit[1]] = &StoreEntry{[]byte(cmdSplit[2]), int32(ttl), time.Now()}
-			k.entryCommited <- entry.Index
-			k.mu.Unlock()
+
+			entry := StoreEntry{
+				Value:      []byte(cmdSplit[2]),
+				Ttl:        int32(ttl),
+				insertedAt: time.Now(),
+			}
+
+			err = k.db.Set([]byte(cmdSplit[1]), []byte(entry.Value), pebble.Sync)
+			if err != nil {
+				slog.Error("error setting key", "key", cmdSplit[1], "err", err)
+				continue
+			}
 
 		case "DEL":
-			k.mu.Lock()
-			delete(k.store, cmdSplit[1])
-			k.entryCommited <- entry.Index
-			k.mu.Unlock()
-		}
-	}
-}
-
-func (k *KVStore) TTLChecker() {
-	ticker := time.NewTicker(200 * time.Millisecond)
-	for {
-		if k.raft.State != raft.Leader {
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-
-		if <-ticker.C; true {
-			k.mu.RLock()
-			start := time.Now()
-			deleted := 0
-			var wg sync.WaitGroup
-			for key, entry := range k.store {
-				if entry.Ttl > 0 && time.Since(entry.insertedAt) > time.Duration(entry.Ttl)*time.Second {
-					go func() {
-						wg.Add(1)
-						defer wg.Done()
-						_, err := k.raft.Submit([]byte(fmt.Sprintf("DEL %s", key)))
-						if err != nil {
-							slog.Error("error submitting ttl delete", "key", key, "err", err)
-							return
-						}
-						deleted++
-					}()
-				}
+			err := k.db.Delete([]byte(cmdSplit[1]), pebble.Sync)
+			if err != nil {
+				slog.Error("error deleting key", "key", cmdSplit[1], "err", err)
+				continue
 			}
-			k.mu.RUnlock()
-			wg.Wait()
-			slog.Info("ttl check", "deleted", deleted, "lock_duration", time.Since(start))
 		}
 	}
 }
 
 func (k *KVStore) Get(key string) ([]byte, bool) {
-	k.mu.RLock()
-	defer k.mu.RUnlock()
-
-	storeEntry, ok := k.store[key]
-	if !ok {
+	val, closer, err := k.db.Get([]byte(key))
+	if err != nil {
 		return []byte{}, false
 	}
-	return storeEntry.Value, true
+	defer closer.Close()
+	return val, true
 }
 
 type SetCommand struct {
@@ -145,22 +124,20 @@ func (k *KVStore) Set(cmd SetCommand) (*SetCommandResponse, error) {
 	for {
 		select {
 		case <-timer.C:
-			k.mu.RLock()
 			// Double check if command was actually committed
-			if _, ok := k.store[cmd.Key]; ok {
-				k.mu.RUnlock()
+			_, closer, err := k.db.Get([]byte(cmd.Key))
+			if err == nil {
+				closer.Close()
 				return &SetCommandResponse{Index: index, Duration: time.Since(start)}, nil
 			}
-			k.mu.RUnlock()
-			return nil, fmt.Errorf("timeout waiting for commit")
+			closer.Close()
+			return nil, fmt.Errorf("timeout waiting for entry to be committed, may be written")
 
 		case id := <-k.entryCommited:
 			if id >= index {
-				// Verify the key exists
-				k.mu.RLock()
-				_, ok := k.store[cmd.Key]
-				k.mu.RUnlock()
-				if ok {
+				_, closer, err := k.db.Get([]byte(cmd.Key))
+				closer.Close()
+				if err == nil {
 					return &SetCommandResponse{Index: index, Duration: time.Since(start)}, nil
 				}
 			}
