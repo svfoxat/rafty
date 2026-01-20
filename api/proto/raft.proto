@@ -1,12 +1,19 @@
 syntax = "proto3";
 
-package raft;
+package rafty;
 
-option go_package = "internal/grpc/proto;proto";
+option go_package = "github.com/svfoxat/rafty/internal/api;rafty";
 
 service RaftService {
   rpc RequestVote (RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
+
+  // used to propose a command to the leader from a follower
+  rpc ProposeCommand (ProposeRequest) returns (AppendEntriesResponse);
+}
+
+message ProposeRequest {
+  bytes command = 1;
 }
 
 message RequestVoteRequest {
@@ -39,4 +46,5 @@ message AppendEntriesRequest {
 message AppendEntriesResponse {
   int32 term = 1;
   bool success = 2;
+  int32 index = 3;
 }

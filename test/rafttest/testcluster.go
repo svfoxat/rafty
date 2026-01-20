@@ -135,7 +135,7 @@ func StartCluster(ctx context.Context, t *testing.T, count int, offset int) []*r
 
 	// Create nodes
 	for i := 0; i < count; i++ {
-		nodes = append(nodes, raft.NewNode(int32(i), peers))
+		nodes = append(nodes, raft.NewNode(int32(i), peers, nil))
 	}
 
 	// Start nodes

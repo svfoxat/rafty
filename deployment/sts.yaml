@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: rafty
-          image: rafty:0.4.1
+          image: rafty:latest
           imagePullPolicy: Never
           env:
             - name: RAFTY_ID
@@ -25,12 +25,27 @@ spec:
                 fieldRef:
                   fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
             - name: RAFTY_PEERS
-              value: "rafty-1.rafty:12345,rafty-2.rafty:12345,rafty-3.rafty:12345"
+              value: "rafty-0.rafty:12345,rafty-1.rafty:12345,rafty-2.rafty:12345"
+            - name: RAFTY_STORAGE_PATH
+              value: "/data/raft.json"
           ports:
             - containerPort: 12345
               protocol: TCP
+            - containerPort: 12346
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /data
       restartPolicy: Always
   serviceName: rafty
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
 ---
 apiVersion: v1
 kind: Service
@@ -46,4 +61,8 @@ spec:
     - port: 12345
       targetPort: 12345
       protocol: TCP
-      name: raft
+      name: raft-grpc
+    - port: 12346
+      targetPort: 12346
+      protocol: TCP
+      name: rafty-grpc

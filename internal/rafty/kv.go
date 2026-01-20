@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
 	"github.com/svfoxat/rafty/internal/raft"
 )
 
@@ -29,7 +28,7 @@ type StoreEntry struct {
 }
 
 func NewKVStore(r *raft.Raft) (*KVStore, error) {
-	db, err := pebble.Open("kvstore", &pebble.Options{FS: vfs.NewMem()})
+	db, err := pebble.Open("data/kvstore", &pebble.Options{})
 	if err != nil {
 		return nil, err
 	}
@@ -54,35 +53,51 @@ func (k *KVStore) processCommits() {
 
 	for entry := range commitChan {
 		cmd := string(entry.Command)
+		slog.Info("processing commit", "index", entry.Index, "command", cmd)
 		cmdSplit := strings.Split(cmd, " ")
 
 		switch cmdSplit[0] {
 		case "SET":
 			// always assume ttl is present
+			if len(cmdSplit) < 4 {
+				slog.Error("invalid SET command format", "cmd", cmd)
+				continue
+			}
 			ttl, err := strconv.Atoi(cmdSplit[3])
 			if err != nil {
 				slog.Error("error parsing ttl", "ttl", cmdSplit[3])
 				continue
 			}
 
-			entry := StoreEntry{
+			entryData := StoreEntry{
 				Value:      []byte(cmdSplit[2]),
 				Ttl:        int32(ttl),
 				insertedAt: time.Now(),
 			}
 
-			err = k.db.Set([]byte(cmdSplit[1]), []byte(entry.Value), pebble.Sync)
+			err = k.db.Set([]byte(cmdSplit[1]), entryData.Value, pebble.Sync)
 			if err != nil {
 				slog.Error("error setting key", "key", cmdSplit[1], "err", err)
 				continue
 			}
 
 		case "DEL":
+			if len(cmdSplit) < 2 {
+				slog.Error("invalid DEL command format", "cmd", cmd)
+				continue
+			}
 			err := k.db.Delete([]byte(cmdSplit[1]), pebble.Sync)
 			if err != nil {
 				slog.Error("error deleting key", "key", cmdSplit[1], "err", err)
 				continue
 			}
+		}
+
+		select {
+		case k.entryCommited <- entry.Index:
+			slog.Info("signaled commit", "index", entry.Index)
+		default:
+			slog.Warn("commit signal channel full", "index", entry.Index)
 		}
 	}
 }
@@ -108,15 +123,13 @@ type SetCommandResponse struct {
 }
 
 func (k *KVStore) Set(cmd SetCommand) (*SetCommandResponse, error) {
-	if k.raft.State != raft.Leader {
-		return nil, fmt.Errorf("not leader")
-	}
-
 	start := time.Now()
 	index, err := k.raft.Propose([]byte(fmt.Sprintf("SET %s %s %d", cmd.Key, cmd.Value, cmd.TTL)))
 	if err != nil {
 		return nil, fmt.Errorf("error submitting command: %v", err)
 	}
+
+	slog.Info("waiting for commit", "index", index, "key", cmd.Key)
 
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
@@ -124,22 +137,26 @@ func (k *KVStore) Set(cmd SetCommand) (*SetCommandResponse, error) {
 	for {
 		select {
 		case <-timer.C:
+			slog.Warn("timeout waiting for commit, double checking DB", "index", index, "key", cmd.Key)
 			// Double check if command was actually committed
-			_, closer, err := k.db.Get([]byte(cmd.Key))
+			val, closer, err := k.db.Get([]byte(cmd.Key))
 			if err == nil {
 				closer.Close()
+				slog.Info("found value in DB after timeout", "key", cmd.Key, "value", string(val))
 				return &SetCommandResponse{Index: index, Duration: time.Since(start)}, nil
 			}
-			closer.Close()
 			return nil, fmt.Errorf("timeout waiting for entry to be committed, may be written")
 
 		case id := <-k.entryCommited:
+			slog.Debug("received commit signal", "received_id", id, "waiting_for", index)
 			if id >= index {
 				_, closer, err := k.db.Get([]byte(cmd.Key))
-				closer.Close()
 				if err == nil {
+					closer.Close()
+					slog.Info("successfully committed and verified", "index", index, "key", cmd.Key, "duration", time.Since(start))
 					return &SetCommandResponse{Index: index, Duration: time.Since(start)}, nil
 				}
+				slog.Warn("commit signaled but key not found in DB", "index", index, "key", cmd.Key)
 			}
 		}
 	}
@@ -150,23 +167,20 @@ type DeleteCommand struct {
 }
 
 func (k *KVStore) Delete(cmd DeleteCommand) error {
-	if k.raft.State != raft.Leader {
-		return fmt.Errorf("not leader")
-	}
-
-	index, err := k.raft.Submit([]byte(fmt.Sprintf("DEL %s", cmd.Key)))
+	index, err := k.raft.Propose([]byte(fmt.Sprintf("DEL %s", cmd.Key)))
 	if err != nil {
-		return fmt.Errorf("error submitting command")
+		return fmt.Errorf("error submitting command: %v", err)
 	}
 
-	timeout := 5 * time.Second
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+
 	for {
 		select {
-		case <-time.After(timeout):
-			slog.Error("timeout waiting for entry to be committed, may be written")
-			return nil
+		case <-timer.C:
+			return fmt.Errorf("timeout waiting for entry to be committed")
 		case id := <-k.entryCommited:
-			if id <= index {
+			if id >= index {
 				slog.Info("kv success", "key", cmd.Key)
 				return nil
 			}

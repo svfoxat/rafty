@@ -68,13 +68,19 @@ func main() {
 		peerList = strings.Split(peers, ",")
 	}
 
+	storagePath := os.Getenv("RAFTY_STORAGE_PATH")
+	if storagePath == "" {
+		storagePath = "raft.json"
+	}
+
 	logger := setupLogger(id)
 
 	// Create a new Rafty Node
 	node := rafty.NewServer(&rafty.ServerConfig{
-		ID:     int32(id),
-		Peers:  peerList,
-		Logger: logger,
+		ID:          int32(id),
+		Peers:       peerList,
+		Logger:      logger,
+		StoragePath: storagePath,
 	})
 
 	err := node.Start(ctx, port+1, port)

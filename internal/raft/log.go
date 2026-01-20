@@ -1,8 +1,12 @@
 package raft
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
 	"time"
+
+	proto "github.com/svfoxat/rafty/internal/api"
 )
 
 type LogEntry struct {
@@ -22,9 +26,9 @@ func (r *Raft) GetLogEntries() []*LogEntry {
 
 func (r *Raft) Submit(command []byte) (int32, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.State != Leader {
+		r.mu.Unlock()
 		return 0, nil
 	}
 
@@ -32,24 +36,57 @@ func (r *Raft) Submit(command []byte) (int32, error) {
 
 	log := &LogEntry{Command: command, Term: r.CurrentTerm, Index: currentLen + 1}
 	r.log = append(r.log, log)
+	r.persist()
 	slog.Info("leader submit", "term", r.CurrentTerm, "node", r.ID, "index", len(r.log))
 
+	r.mu.Unlock()
 	return currentLen + 1, nil
 }
 
 func (r *Raft) Propose(command []byte) (int32, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
-	if r.State != Leader {
-		return -1, nil
+	slog.Info("propose leadercheck", "command", string(command))
+	if r.State == Leader {
+		slog.Info("Iam se leader")
+		log := &LogEntry{Command: command, Term: -1, Index: -1}
+		r.proposeCh <- log
+		idx := int32(len(r.log)) + 1
+		r.mu.Unlock()
+		return idx, nil
 	}
 
-	log := &LogEntry{Command: command, Term: -1, Index: -1}
-	slog.Info("leader propose")
+	// propose the log append to the leader
+	leaderId := r.LeaderID
+	r.mu.Unlock()
 
-	r.proposeCh <- log
-	return int32(len(r.log)) + 1, nil
+	if leaderId == -1 {
+		return 0, fmt.Errorf("no leader elected")
+	}
+
+	idx, _, err := r.forwardToLeader(leaderId, command)
+	if err != nil {
+		return 0, err
+	}
+	return idx, nil
+}
+
+func (r *Raft) forwardToLeader(leaderId int32, command []byte) (int32, bool, error) {
+	leaderHost := fmt.Sprintf("rafty-%d.rafty:12345", leaderId)
+
+	slog.Info("forwarding to leader", "leader", leaderHost, "me", r.ID)
+	slog.Info("map", "peers", r.peerCons)
+
+	leaderClient, ok := r.peerCons[leaderHost]
+	if !ok {
+		return 0, false, fmt.Errorf("no connection to leader %d", leaderId)
+	}
+
+	res, err := leaderClient.ProposeCommand(context.Background(), &proto.ProposeRequest{Command: command})
+	if err != nil {
+		return 0, false, err
+	}
+	return res.Index, res.Success, nil
 }
 
 func (r *Raft) logBatcher() {
@@ -62,6 +99,7 @@ func (r *Raft) logBatcher() {
 			case entry := <-r.proposeCh:
 				r.mu.Lock()
 				r.log = append(r.log, &LogEntry{Command: entry.Command, Term: r.CurrentTerm, Index: int32(len(r.log)) + 1})
+				r.persist()
 				batchSize++
 				r.mu.Unlock()
 			case <-timer.C:

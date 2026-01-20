@@ -2,10 +2,21 @@ package raft
 
 import (
 	"context"
-	"github.com/svfoxat/rafty/internal/grpc/proto"
 	"log/slog"
 	"time"
+
+	proto "github.com/svfoxat/rafty/internal/api"
 )
+
+func (r *Raft) ProposeCommand(ctx context.Context, request *proto.ProposeRequest) (*proto.AppendEntriesResponse, error) {
+	slog.Info("propose command", "command", string(request.Command))
+	index, err := r.Propose(request.Command)
+	if err != nil {
+		return nil, err
+	}
+
+	return &proto.AppendEntriesResponse{Term: r.CurrentTerm, Success: true, Index: index}, nil
+}
 
 // AppendEntries implements the gRPC AppendEntries method.
 func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesRequest) (*proto.AppendEntriesResponse, error) {
@@ -21,6 +32,12 @@ func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 		r.CurrentTerm = req.Term
 		r.State = Follower
 		r.VotedFor = -1
+		r.persist()
+	}
+
+	// Reject if term is lower
+	if req.Term < r.CurrentTerm {
+		return &proto.AppendEntriesResponse{Term: r.CurrentTerm, Success: false}, nil
 	}
 
 	// Update heartbeat
@@ -29,13 +46,15 @@ func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 
 	// Update commit index
 	if req.LeaderCommit > r.commitIndex {
-		r.commitReady <- struct{}{}
 		r.commitIndex = min(req.LeaderCommit, int32(len(r.log)-1))
-	}
-
-	// Reject if term is lower
-	if req.Term < r.CurrentTerm {
-		return &proto.AppendEntriesResponse{Term: r.CurrentTerm, Success: false}, nil
+		slog.Debug("follower commit index updated", "commitIndex", r.commitIndex)
+		select {
+		case r.commitReady <- struct{}{}:
+		default:
+			go func() {
+				r.commitReady <- struct{}{}
+			}()
+		}
 	}
 
 	// Check log consistency
@@ -48,7 +67,10 @@ func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 
 	// Handle empty log special case
 	if req.PrevLogIndex == -1 {
-		r.log = r.log[:0]
+		if len(r.log) > 0 {
+			r.log = r.log[:0]
+			r.persist()
+		}
 	} else if r.log[req.PrevLogIndex].Term != req.PrevLogTerm {
 		// Term mismatch - remove conflicting entries
 		slog.Info("removing conflicting entries",
@@ -56,6 +78,7 @@ func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 			"prevLogTerm", req.PrevLogTerm,
 			"logTerm", r.log[req.PrevLogIndex].Term)
 		r.log = r.log[:req.PrevLogIndex]
+		r.persist()
 
 		return &proto.AppendEntriesResponse{Term: r.CurrentTerm, Success: false}, nil
 	}
@@ -70,6 +93,7 @@ func (r *Raft) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 				Index:   entry.Index,
 			})
 		}
+		r.persist()
 	}
 	return &proto.AppendEntriesResponse{Term: r.CurrentTerm, Success: true}, nil
 }
@@ -91,21 +115,18 @@ func (r *Raft) RequestVote(ctx context.Context, req *proto.RequestVoteRequest) (
 		"candidate_last_idx", req.LastLogIndex)
 
 	// If our log is more up-to-date, reject the vote
-	if r.lastApplied > -1 { // Only check if we have entries
-		lastLogTerm := r.log[r.lastApplied].Term
-		if lastLogTerm > req.LastLogTerm ||
-			(lastLogTerm == req.LastLogTerm && r.lastApplied > req.LastLogIndex) {
-			return &proto.RequestVoteResponse{
-				Term:        r.CurrentTerm,
-				VoteGranted: false,
-			}, nil
-		}
+	lastLogIndex := int32(len(r.log) - 1)
+	lastLogTerm := int32(0)
+	if lastLogIndex >= 0 {
+		lastLogTerm = r.log[lastLogIndex].Term
 	}
 
-	// Reset our term if it's unreasonably high compared to others
-	if r.CurrentTerm > req.Term+100 && r.lastApplied < req.LastLogIndex {
-		r.CurrentTerm = req.Term
-		r.VotedFor = -1
+	if lastLogTerm > req.LastLogTerm ||
+		(lastLogTerm == req.LastLogTerm && lastLogIndex > req.LastLogIndex) {
+		return &proto.RequestVoteResponse{
+			Term:        r.CurrentTerm,
+			VoteGranted: false,
+		}, nil
 	}
 
 	if req.Term < r.CurrentTerm {
@@ -119,17 +140,14 @@ func (r *Raft) RequestVote(ctx context.Context, req *proto.RequestVoteRequest) (
 		r.CurrentTerm = req.Term
 		r.VotedFor = -1
 		r.State = Follower
+		r.persist()
 	}
 
 	if r.VotedFor == -1 || r.VotedFor == req.CandidateID {
-		lastLogTerm := int32(0)
-		if r.lastApplied >= 0 {
-			lastLogTerm = r.log[r.lastApplied].Term
-		}
-
 		if req.LastLogTerm > lastLogTerm ||
-			(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= r.lastApplied) {
+			(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= lastLogIndex) {
 			r.VotedFor = req.CandidateID
+			r.persist()
 			r.lastHeartbeat = time.Now()
 			return &proto.RequestVoteResponse{
 				Term:        r.CurrentTerm,
